@@ -1,0 +1,4 @@
+[submodule "cam2ip"]
+	path = cam2ip
+	url = git@github.com:gen2brain/cam2ip.git
+	branch = master
