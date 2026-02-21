@@ -2,6 +2,7 @@ import os
 import sys
 import base64
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -52,7 +53,8 @@ async def call_tool(name: str, arguments: Any) -> list[types.TextContent | types
         raise ValueError(f"Unknown tool: {name}")
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_S) as client:
-        resp = await client.get(SNAPSHOT_URL)
+        resp = await client.get(SNAPSHOT_URL, params={"_t": time.monotonic_ns()},
+                                headers={"Cache-Control": "no-cache"})
         resp.raise_for_status()
 
         content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip().lower()
