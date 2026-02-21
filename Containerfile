@@ -53,13 +53,17 @@ COPY cam2ip_mcp_server.py .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Expose cam2ip HTTP server port
-EXPOSE 56000
+# Expose cam2ip HTTP server + MCP HTTP server ports
+EXPOSE 56000 3000
 
 # Environment variables with defaults
-ENV CAM2IP_BASE_URL=http://127.0.0.1:56000 \
+ENV CAM2IP_ENABLED=true \
+    CAM2IP_BASE_URL=http://127.0.0.1:56000 \
     CAM2IP_HTTP_TIMEOUT_S=5.0 \
     CAM2IP_BIND_ADDR=0.0.0.0:56000 \
-    CAM2IP_INDEX=0
+    CAM2IP_INDEX=0 \
+    MCP_MODE=stdio \
+    MCP_HTTP_HOST=0.0.0.0 \
+    MCP_HTTP_PORT=3000
 
 ENTRYPOINT ["/entrypoint.sh"]
