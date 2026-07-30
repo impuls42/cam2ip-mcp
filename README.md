@@ -87,9 +87,16 @@ So the server does not take one-shot snapshots. Instead:
    empty, and an arriving frame really is a picture of now.
 2. **It discards the first frames after each connect** (`MCP_WARMUP_FRAMES`,
    `MCP_WARMUP_S`). Those are exactly the pre-idle ones the queue was sitting
-   on. They arrive in an instant burst rather than at the frame rate, which is
-   why there is a time-based window as well as a count — it flushes queues
-   deeper than four. This also covers a camera's auto-exposure ramp.
+   on. They arrive in an instant burst rather than at the frame rate, so a count
+   alone would not flush a queue deeper than it assumes. This also covers a
+   camera's auto-exposure ramp.
+
+   The two bounds cover different frame rates, and which one binds is not the one
+   you might expect. At 30fps the 0.25s window is ~7.5 frames, so the *window*
+   decides and the 5-frame count never binds; below about 20fps the count takes
+   over. Measured drops came out at 7–8 on both Linux/V4L2 and macOS/AVFoundation
+   at 30fps, which is the window doing the work in both cases. Either way at
+   least five frames go, comfortably past a four-buffer queue.
 3. **It caps the age of what it serves** (`MCP_FRAME_MAX_AGE_S`), waiting for a
    newer frame instead of answering with an old one. This age is measured from
    when a frame *arrived*, because HTTP carries no capture timestamp — so it
@@ -109,7 +116,22 @@ cam2ip stamps a frame when it *reads* it out of the buffer queue, not when the
 sensor captured it — which is only the same thing while the pipeline is being
 drained continuously. Under the old snapshot approach the stamp would have read
 as current on an hours-old picture; with the subscription held open the two
-coincide.
+coincide. This was measured: a snapshot taken through the old path came back
+stamped `13:27:29` while showing a scene clock reading `13:26:06`.
+
+### This is a V4L2 problem specifically
+
+The buffer queue described above is Linux's. cam2ip's macOS backend
+(AVFoundation) keeps a single always-overwritten slot and blocks until the next
+frame arrives, so it cannot go stale this way, and testing confirmed neither path
+returns an old frame there — including the one-shot snapshot that fails on Linux.
+Windows behaves like macOS in this respect.
+
+The machinery here is harmless on those platforms rather than useless: the
+max-age bound still catches a stalled pipeline, and it was observed refusing 15s-
+and 71s-old cached frames on macOS. But if you are running on a backend with no
+stale-queue problem and want the cold-start latency back, `MCP_WARMUP_S=0` costs
+you nothing there.
 
 ## Configuration
 
@@ -256,6 +278,33 @@ These are skipped unless `CAM2IP_MCP_IMAGE` is set, and need Linux, since they
 use `--network host` to let the container reach the fake camera. CI runs them
 before anything is published, so a green build alone cannot ship an image that
 fails to start.
+
+### On macOS
+
+The container cannot see your camera. Docker Desktop runs containers in a Linux
+VM with no passthrough for the host's AVFoundation devices, so there is no
+`/dev/video0` inside it — `--list-devices` returns nothing and `docker compose
+up` fails outright with `error gathering device information while adding custom
+device "/dev/video0"`. This is a Docker Desktop limitation, not a problem with
+the image, which builds and runs fine otherwise.
+
+Run the two processes natively instead. cam2ip builds without CGO on darwin too
+(it reaches AVFoundation through `purego`, not cgo):
+
+```bash
+mkdir -p bin
+(cd cam2ip && GOTOOLCHAIN=auto CGO_ENABLED=0 go build \
+  -ldflags "-X main.version=$(git rev-parse --short HEAD)" -o ../bin/cam2ip ./cmd/cam2ip)
+./bin/cam2ip --bind-addr 127.0.0.1:56000 &
+
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+CAM2IP_BASE_URL=http://127.0.0.1:56000 ./.venv/bin/python cam2ip_mcp_server.py
+```
+
+The binary must be named exactly `cam2ip` — it derives its `CAM2IP_*` variable
+prefix from its own filename, so any other name silently ignores that
+configuration. The `-ldflags` are what make `--version` report cam2ip's revision
+rather than this repo's; see the note in the Containerfile.
 
 ### Finding your camera
 

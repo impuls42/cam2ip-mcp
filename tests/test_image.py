@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from mcp.client.stdio import stdio_client
 
 from fake_cam2ip import read_frame_meta, running_fake_cam2ip
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 IMAGE = os.environ.get("CAM2IP_MCP_IMAGE")
 
 pytestmark = [
@@ -73,6 +75,44 @@ class TestDiagnostics:
         )
         assert result.returncode == 0, result.stderr
         assert "cam2ip" in result.stdout
+
+    def test_cam2ip_reports_the_submodule_revision_not_this_repo(self):
+        """The banner must name cam2ip's revision, not the wrapper repo's.
+
+        Left to itself cam2ip falls back to Go's debug.ReadBuildInfo, which stamps
+        whichever git tree the build ran in -- so building the submodule from here
+        reported this repo's HEAD as the cam2ip version, and inside the image
+        (.dockerignore drops .git) it reported "(devel)". Both send someone
+        debugging to the wrong commit, so the build passes the revision in.
+        """
+        expected = subprocess.run(
+            ["git", "-C", "cam2ip", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=30,
+        )
+        if expected.returncode != 0:
+            pytest.skip("cam2ip submodule not checked out")
+        revision = expected.stdout.strip()
+
+        result = subprocess.run(
+            ["docker", "run", "--rm", IMAGE, "--version"],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+
+        this_repo = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=30,
+        ).stdout.strip()
+
+        reported = result.stdout.strip()
+        assert revision in reported, (
+            f"expected cam2ip revision {revision} in {reported!r}; "
+            f"pass --build-arg CAM2IP_VERSION=$(git -C cam2ip rev-parse --short HEAD)"
+        )
+        if this_repo and this_repo != revision:
+            assert this_repo not in reported, (
+                f"banner reports this repo's HEAD ({this_repo}) as the cam2ip version"
+            )
 
     def test_list_devices_runs(self):
         """Finds no cameras on a runner, but must exit cleanly rather than crash."""

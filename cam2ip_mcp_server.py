@@ -250,6 +250,26 @@ def _describe_exception(exc: BaseException) -> str:
         return name
 
 
+def _error_kind(exc: BaseException) -> str:
+    """Classify a stream failure, for choosing what to tell the caller.
+
+    "timeout" is the interesting one. cam2ip's MJPEG handler writes no response
+    headers until it has a frame to put in the first part, so a cam2ip that
+    cannot open the camera leaves us waiting for headers that never come -- we
+    time out without ever seeing a status line. That is indistinguishable at the
+    socket level from a camera merely being slow, but combined with having
+    received no frames at all it is very strong evidence of a missing device,
+    which is the most common way this is misconfigured.
+    """
+    if isinstance(exc, httpx2.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx2.HTTPStatusError):
+        return "http_status"
+    if isinstance(exc, httpx2.TransportError):
+        return "transport"
+    return "other"
+
+
 def _is_permanent(exc: BaseException) -> bool:
     """Whether an error will still be an error after a retry.
 
@@ -298,6 +318,7 @@ class FrameSource:
         self._frames_received = 0
         self._frames_published = 0
         self._last_error: str | None = None
+        self._last_error_kind: str | None = None
         self._permanent_error: str | None = None
 
     # -- public API --------------------------------------------------------
@@ -432,7 +453,9 @@ class FrameSource:
                     raise
                 except Exception as exc:  # noqa: BLE001 - reported via status
                     await self._set_error(
-                        _describe_exception(exc), permanent=_is_permanent(exc)
+                        _describe_exception(exc),
+                        permanent=_is_permanent(exc),
+                        kind=_error_kind(exc),
                     )
 
                     # Reconnecting has to honour the idle timeout too. Without
@@ -550,11 +573,14 @@ class FrameSource:
                 return False
             return time.monotonic() - self._last_grab_at > self._config.stream_idle_s
 
-    async def _set_error(self, message: str | None, permanent: bool = False) -> None:
+    async def _set_error(
+        self, message: str | None, permanent: bool = False, kind: str | None = None
+    ) -> None:
         if message:
             log.warning("stream error: %s", message)
         async with self._cond:
             self._last_error = message
+            self._last_error_kind = kind
             if message is None:
                 self._permanent_error = None
             elif permanent:
@@ -571,19 +597,31 @@ class FrameSource:
         )
         state = self._state(time.monotonic())
 
-        # Reachable but silent is the shape of an unplugged or wedged camera, and
-        # this layer cannot tell those apart: cam2ip reports "no such device" to
-        # its own log and shows us only a stalled stream. So point at the log
-        # rather than guess.
+        # Was sending, then stopped: an unplugged or wedged camera. This layer
+        # cannot tell those apart -- cam2ip reports "no such device" to its own
+        # log and shows us only a stalled stream -- so point at the log.
         if state == "connected_but_no_frames" and self._frames_received:
             return (
                 f"{detail}; cam2ip is connected but has stopped sending frames -- "
                 f"its log distinguishes a camera that is absent from one that is "
                 f"merely slow"
             )
-        # Before the no-frames branch: a refused connection also has no frames,
-        # and telling that caller cam2ip "accepted the connection" would send them
-        # looking at the camera instead of at the address.
+
+        # Never sent anything, and we timed out rather than being refused: cam2ip
+        # is listening but produced no frame to open the response with, which is
+        # what a missing or unopenable camera looks like from here. Worth naming
+        # explicitly, since it is the most common way a first run is misconfigured
+        # -- and a bare "(last error: ReadTimeout)" sends people to the network.
+        if self._frames_received == 0 and self._last_error_kind == "timeout":
+            return (
+                f"{detail}; cam2ip is listening but has not produced a single frame "
+                f"-- it usually means it cannot open the camera. Check the device "
+                f"exists and is passed in (a container needs --device=/dev/video0), "
+                f"and see cam2ip's own log for the reason"
+            )
+
+        # Anything else -- refused connection, 404, non-multipart response -- is
+        # better described by the error itself than by a guess about the camera.
         if self._last_error:
             return f"{detail} (last error: {self._last_error})"
         if self._frames_received == 0:

@@ -9,6 +9,15 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS cam2ip-builder
 
 ARG TARGETARCH
 
+# cam2ip's own revision, for its startup banner. Without it the banner is
+# misleading rather than merely absent: cam2ip falls back to Go's
+# debug.ReadBuildInfo, which stamps whichever git tree the build ran in -- so
+# building the submodule from this repo reports *this* repo's HEAD as the cam2ip
+# version, and inside the image (where .dockerignore drops .git) it reports
+# "(devel)". Either way someone debugging reads the wrong thing.
+#   docker build --build-arg CAM2IP_VERSION=$(git -C cam2ip rev-parse --short HEAD) .
+ARG CAM2IP_VERSION=""
+
 WORKDIR /build
 
 # Copy go.mod/go.sum first so dependency download caches independently of source.
@@ -20,7 +29,7 @@ COPY cam2ip/ ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
     -o cam2ip \
     -trimpath \
-    -ldflags "-s -w" \
+    -ldflags "-s -w ${CAM2IP_VERSION:+-X main.version=$CAM2IP_VERSION}" \
     github.com/gen2brain/cam2ip/cmd/cam2ip
 
 

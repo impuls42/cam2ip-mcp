@@ -108,13 +108,14 @@ class CaptureQueue:
 
 class FakeCam2ip:
     def __init__(self, *, depth: int = 4, fps: float = 30.0, delay_s: float = 0.0,
-                 mjpeg_status: int = 200) -> None:
+                 mjpeg_status: int = 200, stall_headers: bool = False) -> None:
         self.queue = CaptureQueue(depth=depth, fps=fps)
         self.delay_s = delay_s
         self.mjpeg_status = mjpeg_status
         self.mjpeg_connections = 0
         self.jpeg_requests = 0
         self.silent = False
+        self.stall_headers = stall_headers
         self.base_url = ""
         self.app = Starlette(
             routes=[
@@ -146,6 +147,14 @@ class FakeCam2ip:
     async def _mjpeg(self, request: Request) -> Response:
         if self.mjpeg_status != 200:
             return Response("nope", status_code=self.mjpeg_status)
+
+        if self.stall_headers:
+            # What a cam2ip that cannot open the camera does: its MJPEG handler
+            # writes no response headers until it has a frame for the first part,
+            # so the client waits for a status line that never arrives and times
+            # out having never seen the response begin. Distinct from go_silent(),
+            # where headers were sent and frames stopped afterwards.
+            await asyncio.sleep(3600)
 
         self.mjpeg_connections += 1
 

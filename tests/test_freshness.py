@@ -192,6 +192,40 @@ class TestWarmup:
         assert meta["seq"] <= stale_high_water
 
 
+class TestNoCameraAtAll:
+    """The most common way a first run is misconfigured, so the message matters.
+
+    cam2ip writes no response headers until it has a frame for the first part, so
+    a cam2ip that cannot open the camera leaves us timing out without ever seeing
+    a status line. Reporting that as a bare "(last error: ReadTimeout)" sends the
+    reader to look at the network, which is the wrong place.
+    """
+
+    async def test_error_blames_the_camera_not_the_network(self, source_factory):
+        async with running_fake_cam2ip(stall_headers=True) as fake:
+            source = source_factory(
+                fake.base_url, http_timeout_s=0.3, grab_timeout_s=1.0
+            )
+
+            with pytest.raises(FrameUnavailable) as excinfo:
+                await source.grab()
+
+        message = str(excinfo.value)
+        assert "cannot open the camera" in message, message
+        assert "--device=/dev/video0" in message, message
+
+    async def test_a_refused_connection_is_not_blamed_on_the_camera(self, source_factory):
+        """The other side of it: nothing listening is an address problem."""
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.0)
+
+        with pytest.raises(FrameUnavailable) as excinfo:
+            await source.grab()
+
+        message = str(excinfo.value)
+        assert "cannot open the camera" not in message, message
+        assert "last error" in message
+
+
 class TestFailureModes:
     async def test_reports_a_useful_error_when_cam2ip_is_down(self, source_factory):
         source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.0)
