@@ -380,7 +380,91 @@ class TestIdleWhileFailing:
         assert frame.data
 
 
+class TestStatusDuringACameraOutage:
+    """A camera that vanishes leaves the HTTP link to cam2ip perfectly alive.
+
+    cam2ip holds the response open and simply stops writing parts, so
+    stream_connected and stream_running both stay true through a total outage.
+    Read on their own they say "fine" while nothing works, which is why status
+    leads with a state field instead.
+    """
+
+    async def test_state_says_connected_but_no_frames(self, fake_cam, source_factory):
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.5, grab_timeout_s=1.0, stream_idle_s=30.0
+        )
+        await source.grab()
+        assert source.status()["state"] == "streaming"
+
+        fake_cam.go_silent()
+        await asyncio.sleep(1.0)  # longer than http_timeout_s, so frames are overdue
+        status = source.status()
+
+        assert status["state"] == "connected_but_no_frames"
+        # The misleading pair, still true about what it measures.
+        assert status["stream_connected"] is True
+        assert status["stream_running"] is True
+
+    async def test_error_names_the_timeout_without_a_dangling_colon(
+        self, fake_cam, source_factory
+    ):
+        """httpx2 timeouts stringify to nothing, so "ReadTimeout: " was all it said."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.5, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        error = source.status()["last_error"]
+        assert error, "no error recorded for a stream that went silent"
+        assert not error.rstrip().endswith(":"), f"dangling colon in {error!r}"
+        assert "Timeout" in error
+        assert "/mjpeg" in error, f"expected the URL in {error!r}"
+
+    async def test_grab_error_points_at_cam2ips_own_log(self, fake_cam, source_factory):
+        """This layer cannot tell an absent camera from a slow one; cam2ip can."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.0, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+
+        with pytest.raises(FrameUnavailable, match="stopped sending frames"):
+            await source.grab()
+
+    async def test_recovers_when_frames_resume(self, fake_cam, source_factory):
+        """The replug case: no restart, no intervention."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.0, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        fake_cam.silent = False
+        frame = await source.grab()
+
+        assert frame.data.startswith(b"\xff\xd8")
+        assert source.status()["state"] == "streaming"
+
+
 class TestStatus:
+    @pytest.mark.parametrize(
+        "expected", ["idle", "streaming"]
+    )
+    async def test_state_tracks_the_lifecycle(self, fake_cam, source_factory, expected):
+        source = source_factory(fake_cam.base_url, stream_idle_s=30.0)
+        if expected == "streaming":
+            await source.grab()
+        assert source.status()["state"] == expected
+
     async def test_status_does_not_wake_the_stream(self, fake_cam, source_factory):
         """Diagnostics must not disturb what they are measuring.
 

@@ -184,9 +184,23 @@ which is why every log line from both the entrypoint and cam2ip goes to stderr.
 - `max_age_s` — maximum acceptable frame age in seconds. Defaults to
   `MCP_FRAME_MAX_AGE_S`. Raise it to trade freshness for a faster reply.
 
-`camera_status` takes none, and reports whether the stream is connected, how
-many frames have been received and published, the age of the frame in memory,
-and the last error — which is where to look first if `grab_frame` is failing.
+`camera_status` takes none, and is where to look first if `grab_frame` is
+failing. It leads with `state`, which is the field to read:
+
+| `state` | Meaning |
+|---|---|
+| `idle` | No subscription; the camera is released. Normal between requests. |
+| `streaming` | Frames arriving at the frame rate. |
+| `reconnecting` | The stream dropped and is being re-established. |
+| `connected_but_no_frames` | cam2ip is reachable but has stopped sending — an unplugged or wedged camera. |
+| `failed` | An error a retry cannot fix, such as a 404 or a non-MJPEG response. |
+
+`stream_connected` and `stream_running` describe the HTTP conversation with
+cam2ip, **not** the camera: both stay `true` when the camera is unplugged,
+because cam2ip holds the response open and simply stops writing to it. Read
+`state` and the frame counters instead. Also reported: frames received and
+published (their difference is the warm-up discard), the age of the frame in
+memory, the last error, and whether that error is one a retry could fix.
 `last_error_is_permanent` distinguishes the two kinds: a refused connection or a
 timeout is worth retrying and gets ridden out until `MCP_GRAB_TIMEOUT_S`, while a
 4xx or a response that is not MJPEG at all cannot be fixed by reconnecting, so
@@ -289,6 +303,32 @@ message prints both `CAM2IP_BASE_URL` and `CAM2IP_BIND_ADDR`, because a mismatch
 between them is the usual cause: cam2ip listens only on the address it bound to,
 so narrowing the bind to one interface without pointing the base URL at the same
 place leaves the MCP server with nowhere to fetch from.
+
+**The camera was unplugged and replugged.** Getting back from this needs three
+things, and the shipped compose file only gives you one of them:
+
+1. `CAM2IP_LAZY=true` (the default) is the only setting that *can* self-heal.
+   cam2ip closes the device while nothing is subscribed, so the next request
+   reopens it. With `CAM2IP_LAZY=false` it holds the original handle and retries
+   reads against a device that is gone — measured at every grab failing until
+   the container is restarted, with no recovery on its own.
+2. The container has to be able to *see* the replugged device. A compose
+   `devices:` mapping cannot: it is resolved once at container-create, so the
+   node inside the container keeps pointing at a minor number the kernel has
+   moved on from. Under a plain mapping neither `CAM2IP_LAZY` setting survives a
+   replug, and the failure is not cam2ip's.
+3. The kernel may not return the camera on the same minor, especially if it was
+   held open when it disappeared — it can come back as `video1`. Mapping a
+   `/dev/v4l/by-id/...` path instead of `/dev/video0` makes a restart enough,
+   since the symlink follows the device. See the notes in `docker-compose.yml`
+   for that and for the `/dev` bind-mount that avoids the restart entirely.
+
+`camera_status` reports `state: connected_but_no_frames` throughout, which is the
+signature to look for. Note that `stream_connected` and `stream_running` both
+stay `true`: they describe the HTTP conversation with cam2ip, which is untouched
+by the camera going away. The container `HEALTHCHECK` stays green too, for the
+same reason — it probes the two HTTP ports, neither of which depends on a camera.
+It is a check that the processes are alive, not that the camera is.
 
 **Camera not accessible.** Confirm the device is passed in
 (`--device=/dev/video0:/dev/video0`) and that it exists on the host:

@@ -114,6 +114,7 @@ class FakeCam2ip:
         self.mjpeg_status = mjpeg_status
         self.mjpeg_connections = 0
         self.jpeg_requests = 0
+        self.silent = False
         self.base_url = ""
         self.app = Starlette(
             routes=[
@@ -132,6 +133,16 @@ class FakeCam2ip:
             headers={"Cache-Control": "no-store, no-cache", "Connection": "close"},
         )
 
+    def go_silent(self) -> None:
+        """Hold the connection open but stop sending frames.
+
+        What an unplugged USB camera looks like from this side: cam2ip keeps the
+        HTTP response open and its capture loop just fails, so the link stays up
+        while frames stop. Nothing at the HTTP layer signals the difference
+        between this and a very slow camera.
+        """
+        self.silent = True
+
     async def _mjpeg(self, request: Request) -> Response:
         if self.mjpeg_status != 200:
             return Response("nope", status_code=self.mjpeg_status)
@@ -144,6 +155,8 @@ class FakeCam2ip:
             # every delimiter after it.
             first = True
             while True:
+                while self.silent:
+                    await asyncio.sleep(0.05)
                 frame = await self.queue.capture()
                 prefix = b"" if first else b"\r\n"
                 first = False

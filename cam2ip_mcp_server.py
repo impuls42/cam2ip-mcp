@@ -231,6 +231,25 @@ class FrameUnavailable(RuntimeError):
     """No sufficiently fresh frame could be obtained."""
 
 
+def _describe_exception(exc: BaseException) -> str:
+    """Render an exception for the status output and error messages.
+
+    httpx2's timeouts stringify to the empty string, so the obvious
+    f"{type(exc).__name__}: {exc}" yields "ReadTimeout: " -- a dangling colon
+    that looks like a truncated message. Fall back to the URL, which is the part
+    a reader actually wants, and to the bare class name if even that is missing.
+    """
+    name = type(exc).__name__
+    detail = str(exc).strip()
+    if detail:
+        return f"{name}: {detail}"
+    try:
+        return f"{name} for {exc.request.url}"  # type: ignore[attr-defined]
+    except (AttributeError, RuntimeError):
+        # httpx raises RuntimeError from .request when no request is attached.
+        return name
+
+
 def _is_permanent(exc: BaseException) -> bool:
     """Whether an error will still be an error after a retry.
 
@@ -333,10 +352,34 @@ class FrameSource:
                     self._waiters -= 1
                     self._last_grab_at = max(self._last_grab_at, time.monotonic())
 
+    def _state(self, now: float) -> str:
+        """One word for what is actually going on, for readers who stop at the top.
+
+        The two connection booleans describe the HTTP link to cam2ip, which stays
+        perfectly alive when the camera is unplugged -- cam2ip keeps the response
+        open and simply stops writing parts. Read on their own they say "fine"
+        during a total camera outage, so this leads instead.
+        """
+        if self._task is None:
+            return "idle"
+        if self._permanent_error is not None:
+            return "failed"
+        if not self._connected:
+            return "reconnecting"
+        # Connected but dry. A live stream delivers at the frame rate, so silence
+        # for longer than the read timeout means frames are not coming -- the
+        # camera is gone, or wedged, whatever cam2ip's own log says.
+        if self._frame is None or now - self._frame_at > self._config.http_timeout_s:
+            return "connected_but_no_frames"
+        return "streaming"
+
     def status(self) -> dict[str, object]:
         now = time.monotonic()
         return {
+            "state": self._state(now),
             "cam2ip_url": self._config.base_url,
+            # Both of these are about the HTTP conversation with cam2ip, not
+            # about the camera; see _state.
             "stream_connected": self._connected,
             "stream_running": self._task is not None,
             "frames_received": self._frames_received,
@@ -388,7 +431,9 @@ class FrameSource:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - reported via status
-                    await self._set_error(f"{type(exc).__name__}: {exc}", permanent=_is_permanent(exc))
+                    await self._set_error(
+                        _describe_exception(exc), permanent=_is_permanent(exc)
+                    )
 
                     # Reconnecting has to honour the idle timeout too. Without
                     # this the retry loop is the one path that never checks, so
@@ -434,7 +479,11 @@ class FrameSource:
                 )
 
             self._connected = True
-            await self._set_error(None)
+            # Deliberately not clearing the last error here. Opening the socket
+            # proves cam2ip is listening, not that the camera works -- during an
+            # outage this loop reconnects happily and never sees a frame, and
+            # clearing on connect made the one useful diagnostic flicker in and
+            # out. _publish clears it, because a frame is the actual proof.
 
             # Frames already sitting in the driver's queue when we subscribed
             # are exactly the stale ones, and they arrive in an instant burst
@@ -478,6 +527,9 @@ class FrameSource:
             self._content_type = content_type
             self._frame_at = time.monotonic()
             self._frames_published += 1
+            # Frames are flowing, so whatever went wrong before is now resolved.
+            self._last_error = None
+            self._permanent_error = None
             self._cond.notify_all()
 
     async def _should_go_idle(self) -> bool:
@@ -517,6 +569,21 @@ class FrameSource:
             f"no frame newer than {max_age:g}s from {self._mjpeg_url} "
             f"within {self._config.grab_timeout_s:g}s"
         )
+        state = self._state(time.monotonic())
+
+        # Reachable but silent is the shape of an unplugged or wedged camera, and
+        # this layer cannot tell those apart: cam2ip reports "no such device" to
+        # its own log and shows us only a stalled stream. So point at the log
+        # rather than guess.
+        if state == "connected_but_no_frames" and self._frames_received:
+            return (
+                f"{detail}; cam2ip is connected but has stopped sending frames -- "
+                f"its log distinguishes a camera that is absent from one that is "
+                f"merely slow"
+            )
+        # Before the no-frames branch: a refused connection also has no frames,
+        # and telling that caller cam2ip "accepted the connection" would send them
+        # looking at the camera instead of at the address.
         if self._last_error:
             return f"{detail} (last error: {self._last_error})"
         if self._frames_received == 0:

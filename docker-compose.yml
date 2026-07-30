@@ -9,6 +9,24 @@ services:
     # Grant access to the video device. Change the index on both sides if your
     # camera is not /dev/video0; `docker run --rm <image> --list-devices` lists
     # what the container can see.
+    #
+    # Note this does not survive unplugging the camera. Compose resolves a
+    # `devices:` mapping once, at container-create, and Docker mknods a static
+    # node inside the container -- so on replug the container is still pointing
+    # at a minor number the kernel has moved on from, and no CAM2IP_LAZY setting
+    # can rescue that. A stable by-id path at least makes a restart sufficient
+    # instead of a compose edit, because the symlink follows the device:
+    #
+    #   ls -l /dev/v4l/by-id/          # find yours
+    #   devices:
+    #     - /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXX-video-index0:/dev/video0
+    #
+    # For a container that survives replug with no restart at all, give it the
+    # live device tree rather than a snapshot of one node:
+    #
+    #   volumes:
+    #     - /dev:/dev
+    #   device_cgroup_rules: ['c 81:* rmw']
     devices:
       - /dev/video0:/dev/video0
 
