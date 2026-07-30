@@ -211,6 +211,23 @@ Worth knowing about the coverage:
 - `tests/test_transports.py` launches the server as a subprocess and speaks MCP
   to it over stdio and Streamable HTTP.
 
+### Testing the image
+
+The tests above run against the source tree. To check the built image instead —
+that the pinned dependencies resolve inside `python:3.12-alpine`, that the
+CGO-free cam2ip binary executes in a runtime stage with no build tools, and that
+`docker run -i` gives the server a working stdin:
+
+```bash
+docker build -f Containerfile -t cam2ip-mcp:dev .
+CAM2IP_MCP_IMAGE=cam2ip-mcp:dev python -m pytest tests/test_image.py -v
+```
+
+These are skipped unless `CAM2IP_MCP_IMAGE` is set, and need Linux, since they
+use `--network host` to let the container reach the fake camera. CI runs them
+before anything is published, so a green build alone cannot ship an image that
+fails to start.
+
 ### Finding your camera
 
 ```bash
