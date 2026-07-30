@@ -619,18 +619,35 @@ class FrameSource:
             return (
                 f"{detail}; cam2ip is listening but has not produced a single frame "
                 f"-- it usually means it cannot open the camera. Check the device "
-                f"exists and is passed in (a container needs --device=/dev/video0), "
-                f"and see cam2ip's own log for the reason"
+                f"exists, and that it is passed in if cam2ip runs in a container "
+                f"(--device=/dev/video0 on Linux). cam2ip's own log gives the reason"
             )
 
         # Anything else -- refused connection, 404, non-multipart response -- is
         # better described by the error itself than by a guess about the camera.
         if self._last_error:
             return f"{detail} (last error: {self._last_error})"
-        if self._frames_received == 0:
+
+        # Connected is load-bearing here, not decoration. Without it this branch
+        # also caught the case below, and told someone whose connection was
+        # refused that cam2ip had accepted it.
+        if self._frames_received == 0 and self._connected:
             return (
                 f"{detail}; cam2ip accepted the connection but sent no frames -- "
-                f"check that it can open the camera (container needs --device=/dev/video0)"
+                f"check that it can open the camera"
+            )
+
+        # No frames, no error, never connected: the deadline expired while the
+        # connection attempt was still outstanding, so we genuinely do not know
+        # why yet. Windows reaches this readily -- a refused loopback connect
+        # takes about a second to surface there, against microseconds on Linux --
+        # and guessing at the camera would be wrong twice over.
+        if self._frames_received == 0:
+            return (
+                f"{detail}; the connection attempt had not finished, so there is "
+                f"no error to report yet -- check CAM2IP_BASE_URL points somewhere "
+                f"cam2ip is listening, and raise MCP_GRAB_TIMEOUT_S if it is simply "
+                f"slower to answer than that"
             )
         return detail
 

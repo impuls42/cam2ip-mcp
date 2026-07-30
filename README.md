@@ -128,6 +128,11 @@ as current on an hours-old picture; with the subscription held open the two
 coincide. This was measured: a snapshot taken through the old path came back
 stamped `13:27:29` while showing a scene clock reading `13:26:06`.
 
+One limitation of the overlay: cam2ip draws it as light glyphs with no contrast
+plate, so it washes out against a bright scene — which is precisely when someone
+is likely to be squinting at an overexposed stream trying to work out what it is
+showing. Turn it off with `CAM2IP_TIMESTAMP=false` if it is not earning its keep.
+
 ### This is a V4L2 problem specifically
 
 The buffer queue described above is Linux's. cam2ip's macOS backend
@@ -170,6 +175,14 @@ supports works without this project knowing about it:
 
 Run `docker run --rm <image> --help` for the authoritative list — any flag shown
 there has a matching variable.
+
+> **On Windows, these variables do nothing if the binary is named `cam2ip.exe`.**
+> cam2ip derives the prefix from its own filename, and the mapping uppercases and
+> replaces hyphens but not dots — so `cam2ip.exe` looks for `CAM2IP.EXE_WIDTH`
+> rather than `CAM2IP_WIDTH`. Nothing warns you; the flags simply keep their
+> defaults. Either build the binary with no extension (Windows runs an
+> extensionless PE file fine) or pass command-line flags instead. This does not
+> affect the container, where the binary is `cam2ip`.
 
 ### MCP server options
 
@@ -229,9 +242,13 @@ failing. It leads with `state`, which is the field to read:
 `stream_connected` and `stream_running` describe the HTTP conversation with
 cam2ip, **not** the camera: both stay `true` when the camera is unplugged,
 because cam2ip holds the response open and simply stops writing to it. Read
-`state` and the frame counters instead. Also reported: frames received and
-published (their difference is the warm-up discard), the age of the frame in
+`state` and the frame counters instead. Also reported: the age of the frame in
 memory, the last error, and whether that error is one a retry could fix.
+
+`frames_received` and `frames_published` are cumulative for the life of the
+server process, not per-connection. Their difference is every warm-up discard
+since startup added together, so to see one cycle's discard take the delta across
+that cycle rather than reading the totals.
 `last_error_is_permanent` distinguishes the two kinds: a refused connection or a
 timeout is worth retrying and gets ridden out until `MCP_GRAB_TIMEOUT_S`, while a
 4xx or a response that is not MJPEG at all cannot be fixed by reconnecting, so

@@ -194,6 +194,69 @@ class TestWarmup:
         assert meta["seq"] <= stale_high_water
 
 
+class TestTimeoutMessageNamesTheRightSuspect:
+    """Every branch of the failure message, without depending on network timing.
+
+    These matter because the message is the only diagnosis most people will get,
+    and pointing at the wrong layer costs more time than saying nothing. Driven by
+    setting the state each branch keys on, so the same cases hold on any platform
+    -- a refused connect surfaces in microseconds on Linux and about a second on
+    Windows, which is exactly how the "had not finished" case was found.
+    """
+
+    @staticmethod
+    def _message(**state) -> str:
+        source = FrameSource(make_config("http://camera.invalid:56000", grab_timeout_s=1.0))
+        source._task = "pump"  # noqa: SLF001 - a running pump, without starting one
+        for name, value in state.items():
+            setattr(source, f"_{name}", value)
+        return source._timeout_message(1.0)  # noqa: SLF001
+
+    def test_connect_still_outstanding_does_not_guess(self):
+        """No error yet and never connected: say so, do not invent a cause."""
+        message = self._message(connected=False, frames_received=0, last_error=None)
+
+        assert "had not finished" in message
+        assert "CAM2IP_BASE_URL" in message
+        assert "accepted the connection" not in message
+        assert "/dev/video0" not in message
+
+    def test_connected_but_silent_blames_the_camera(self):
+        message = self._message(connected=True, frames_received=0, last_error=None)
+
+        assert "accepted the connection" in message
+        assert "open the camera" in message
+
+    def test_listening_but_never_produced_a_frame_blames_the_camera(self):
+        message = self._message(
+            connected=False, frames_received=0,
+            last_error="ReadTimeout for http://camera.invalid:56000/mjpeg",
+            last_error_kind="timeout",
+        )
+
+        assert "not produced a single frame" in message
+        assert "open the camera" in message
+
+    def test_an_error_is_carried_verbatim(self):
+        message = self._message(
+            connected=False, frames_received=0,
+            last_error="ConnectError: All connection attempts failed",
+            last_error_kind="transport",
+        )
+
+        assert "ConnectError" in message
+        assert "open the camera" not in message
+
+    def test_frames_then_silence_points_at_cam2ips_log(self):
+        message = self._message(
+            connected=True, frames_received=100, frame=b"x", frame_at=0.0,
+            last_error=None,
+        )
+
+        assert "stopped sending frames" in message
+        assert "log" in message
+
+
 class TestNoCameraAtAll:
     """The most common way a first run is misconfigured, so the message matters.
 
@@ -217,7 +280,14 @@ class TestNoCameraAtAll:
         assert "--device=/dev/video0" in message, message
 
     async def test_a_refused_connection_is_not_blamed_on_the_camera(self, source_factory):
-        """The other side of it: nothing listening is an address problem."""
+        """The other side of it: nothing listening is an address problem.
+
+        Deliberately uses a short deadline, because that is the case that used to
+        misreport. How fast a refused connect surfaces is platform-dependent --
+        microseconds on Linux, about a second on Windows -- so on a slow one the
+        deadline can expire before any error exists, and the message must still
+        not invent a camera fault.
+        """
         source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.0)
 
         with pytest.raises(FrameUnavailable) as excinfo:
@@ -225,12 +295,37 @@ class TestNoCameraAtAll:
 
         message = str(excinfo.value)
         assert "cannot open the camera" not in message, message
-        assert "last error" in message
+        assert "accepted the connection" not in message, message
+        assert "/dev/video0" not in message, message
+        assert self._names_the_address_or_the_error(message), message
+
+    @staticmethod
+    def _names_the_address_or_the_error(message: str) -> bool:
+        """Either the underlying error, or an honest "we do not know yet"."""
+        return "last error" in message or "CAM2IP_BASE_URL" in message
+
+    async def test_carries_the_connection_error_once_it_surfaces(self, source_factory):
+        """Given long enough for the connect to actually fail, say why.
+
+        The deadline has to clear the slowest platform's refusal latency, which is
+        why this is not the one-second case above.
+        """
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=5.0)
+
+        with pytest.raises(FrameUnavailable) as excinfo:
+            await source.grab()
+
+        message = str(excinfo.value)
+        assert "last error" in message, message
+        assert "cannot open the camera" not in message, message
 
 
 class TestFailureModes:
     async def test_reports_a_useful_error_when_cam2ip_is_down(self, source_factory):
-        source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.0)
+        # Long enough for a refused connect to surface on any platform; a short
+        # deadline is covered separately, where the point is that it must not
+        # guess at a cause it does not have yet.
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=5.0)
 
         with pytest.raises(FrameUnavailable) as excinfo:
             await source.grab()
