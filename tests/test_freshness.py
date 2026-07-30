@@ -361,6 +361,32 @@ class TestIdleWhileFailing:
 
 
 class TestStatus:
+    async def test_status_does_not_wake_the_stream(self, fake_cam, source_factory):
+        """Diagnostics must not disturb what they are measuring.
+
+        Checking idle depth is one of the main uses of this tool, and it would be
+        useless -- worse, misleading -- if asking reopened the camera and reset
+        the counters. It holds because status() only reads; this keeps it that
+        way.
+        """
+        source = source_factory(fake_cam.base_url, stream_idle_s=0.0)
+        await source.grab()
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+        assert source.status()["stream_running"] is False
+
+        frozen = source.status()["frames_received"]
+        for _ in range(10):
+            source.status()
+            await asyncio.sleep(0.02)
+
+        assert source.status()["frames_received"] == frozen
+        assert source.status()["stream_running"] is False
+        assert fake_cam.mjpeg_connections == 1
+
     async def test_status_reports_the_stream(self, fake_cam, source_factory):
         source = source_factory(fake_cam.base_url)
         assert source.status()["stream_connected"] is False
