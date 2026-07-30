@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# The test suite runs a fake cam2ip (starlette + uvicorn, both already pulled in
+# by mcp) and drives the server over real MCP transports.
+pytest>=8.0
+pytest-asyncio>=0.24

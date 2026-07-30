@@ -1,0 +1,688 @@
+"""Regression tests for the stale-frame bug.
+
+The assertions here are timing-independent where it matters: each test notes the
+highest frame the fake camera had captured *before* the grab, and then requires
+the frame it got back to be a later one. Any frame from the pre-existing queue
+fails that, which is exactly the bug.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import time
+
+import httpx2
+import pytest
+
+from cam2ip_mcp_server import FrameSource, FrameUnavailable
+from conftest import make_config
+from fake_cam2ip import read_frame_meta, running_fake_cam2ip
+
+
+@pytest.fixture
+async def source_factory():
+    """Build FrameSources and guarantee they are shut down after the test."""
+    created: list[FrameSource] = []
+
+    def factory(base_url: str, **overrides) -> FrameSource:
+        source = FrameSource(make_config(base_url, **overrides))
+        created.append(source)
+        return source
+
+    yield factory
+    for source in created:
+        await source.aclose()
+
+
+class TestTheBugItself:
+    async def test_one_shot_snapshot_returns_a_stale_frame(self, fake_cam):
+        """Baseline: what the old implementation did, and why it looked broken.
+
+        One GET per request dequeues one buffer, so an idle pipeline hands back
+        whatever it was sitting on.
+        """
+        await asyncio.sleep(0.5)  # nothing draining; the queue holds old frames
+        stale_high_water = fake_cam.queue.captured
+
+        async with httpx2.AsyncClient() as client:
+            response = await client.get(f"{fake_cam.base_url}/jpeg")
+        meta = read_frame_meta(response.content)
+
+        assert meta["seq"] <= stale_high_water, "fake camera is not modelling the queue"
+        assert time.time() - meta["captured_at"] > 0.4, "expected a pre-idle frame"
+
+    async def test_consecutive_snapshots_walk_through_the_stale_queue(self, fake_cam):
+        """And the frames after it are the *rest* of the old queue, in order."""
+        await asyncio.sleep(0.5)
+        stale_high_water = fake_cam.queue.captured
+
+        async with httpx2.AsyncClient() as client:
+            seqs = [
+                read_frame_meta((await client.get(f"{fake_cam.base_url}/jpeg")).content)["seq"]
+                for _ in range(3)
+            ]
+
+        assert seqs == sorted(seqs)
+        assert all(seq <= stale_high_water for seq in seqs)
+
+
+class TestTheFix:
+    async def test_grab_skips_the_stale_queue(self, fake_cam, source_factory):
+        """The headline case: first grab after an idle period is a live frame."""
+        await asyncio.sleep(0.5)
+        stale_high_water = await fake_cam.queue.wait_until_stalled()
+        source = source_factory(fake_cam.base_url)
+
+        frame = await source.grab()
+        meta = read_frame_meta(frame.data)
+
+        assert meta["seq"] > stale_high_water, (
+            f"served frame {meta['seq']} from the stale queue "
+            f"(everything <= {stale_high_water} predates the call)"
+        )
+        assert time.time() - meta["captured_at"] < 1.0
+        assert frame.content_type == "image/jpeg"
+        assert frame.data.startswith(b"\xff\xd8")
+
+    async def test_repeated_grabs_keep_returning_newer_frames(self, fake_cam, source_factory):
+        source = source_factory(fake_cam.base_url, frame_max_age_s=0.2)
+
+        seqs = []
+        for _ in range(4):
+            frame = await source.grab()
+            seqs.append(read_frame_meta(frame.data)["seq"])
+            await asyncio.sleep(0.3)
+
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+
+    async def test_grab_on_a_warm_stream_returns_a_frame_from_just_now(
+        self, fake_cam, source_factory
+    ):
+        """While the stream is up, the newest frame is always a picture of now.
+
+        The stalled-queue watermark cannot be used here: the pump is draining
+        continuously, so the driver keeps capturing and its counter stays a few
+        in-flight frames ahead of whatever has been delivered. The frame's own
+        capture timestamp is the meaningful check.
+        """
+        source = source_factory(fake_cam.base_url)
+        first = read_frame_meta((await source.grab()).data)
+
+        await asyncio.sleep(1.0)
+        second = read_frame_meta((await source.grab()).data)
+
+        assert second["seq"] > first["seq"]
+        assert time.time() - second["captured_at"] < 0.5
+
+    async def test_a_recent_frame_is_served_without_waking_the_camera_again(
+        self, fake_cam, source_factory
+    ):
+        """A frame still inside max_age is answered from memory.
+
+        stream_idle_s=0 drops the subscription straight after the first grab, so
+        a needless second camera wake-up would show up as another connection.
+        """
+        source = source_factory(fake_cam.base_url, frame_max_age_s=5.0, stream_idle_s=0.0)
+        first = await source.grab()
+        await asyncio.sleep(0.1)
+        second = await source.grab()
+
+        assert fake_cam.mjpeg_connections == 1
+        first_meta, second_meta = read_frame_meta(first.data), read_frame_meta(second.data)
+        assert second_meta["seq"] >= first_meta["seq"]
+
+    async def test_stream_is_reused_between_close_together_grabs(self, fake_cam, source_factory):
+        """A warm stream should be reused, not reconnected per call."""
+        source = source_factory(fake_cam.base_url, stream_idle_s=30.0)
+        for _ in range(3):
+            await source.grab()
+
+        assert fake_cam.mjpeg_connections == 1
+        assert fake_cam.jpeg_requests == 0, "the snapshot endpoint should not be used"
+
+    async def test_idle_stream_is_dropped_then_restarted_fresh(self, fake_cam, source_factory):
+        """Going idle releases the camera; the next grab still gets a live frame."""
+        # max_age below the gap we wait, so the second grab cannot be answered
+        # from the frame the first one left in memory.
+        source = source_factory(fake_cam.base_url, stream_idle_s=0.0, frame_max_age_s=0.2)
+        await source.grab()
+
+        async def stream_stopped() -> bool:
+            for _ in range(200):
+                if not source.status()["stream_running"]:
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
+        assert await stream_stopped(), "stream should shut down when idle"
+
+        # Nothing is draining now, so the queue refills and goes stale.
+        await asyncio.sleep(0.5)
+        stale_high_water = await fake_cam.queue.wait_until_stalled()
+
+        meta = read_frame_meta((await source.grab()).data)
+        assert meta["seq"] > stale_high_water
+        assert fake_cam.mjpeg_connections == 2
+
+
+class TestWarmup:
+    async def test_warmup_drops_at_least_the_whole_buffer_queue(self, source_factory):
+        """A queue deeper than warmup_frames is still flushed, thanks to warmup_s."""
+        async with running_fake_cam2ip(depth=12, fps=60.0) as fake:
+            await asyncio.sleep(0.7)  # fill all 12 buffers, then let them age
+            stale_high_water = fake.queue.captured
+            assert stale_high_water >= 12
+
+            source = source_factory(fake.base_url, warmup_frames=2, warmup_s=0.5)
+            meta = read_frame_meta((await source.grab()).data)
+
+            assert meta["seq"] > stale_high_water
+
+    async def test_disabling_warmup_exposes_the_stale_queue(self, fake_cam, source_factory):
+        """Documents why warm-up is load-bearing rather than belt-and-braces.
+
+        Arrival time cannot distinguish a queued frame from a live one, so with
+        warm-up off the first frame served after an idle period is stale again.
+        """
+        await asyncio.sleep(0.5)
+        stale_high_water = fake_cam.queue.captured
+        source = source_factory(fake_cam.base_url, warmup_frames=0, warmup_s=0.0)
+
+        meta = read_frame_meta((await source.grab()).data)
+        assert meta["seq"] <= stale_high_water
+
+
+class TestTimeoutMessageNamesTheRightSuspect:
+    """Every branch of the failure message, without depending on network timing.
+
+    These matter because the message is the only diagnosis most people will get,
+    and pointing at the wrong layer costs more time than saying nothing. Driven by
+    setting the state each branch keys on, so the same cases hold on any platform
+    -- a refused connect surfaces in microseconds on Linux and about a second on
+    Windows, which is exactly how the "had not finished" case was found.
+    """
+
+    @staticmethod
+    def _message(**state) -> str:
+        source = FrameSource(make_config("http://camera.invalid:56000", grab_timeout_s=1.0))
+        source._task = "pump"  # noqa: SLF001 - a running pump, without starting one
+        for name, value in state.items():
+            setattr(source, f"_{name}", value)
+        return source._timeout_message(1.0)  # noqa: SLF001
+
+    def test_connect_still_outstanding_does_not_guess(self):
+        """No error yet and never connected: say so, do not invent a cause."""
+        message = self._message(connected=False, frames_received=0, last_error=None)
+
+        assert "had not finished" in message
+        assert "CAM2IP_BASE_URL" in message
+        assert "accepted the connection" not in message
+        assert "/dev/video0" not in message
+
+    def test_connected_but_silent_blames_the_camera(self):
+        message = self._message(connected=True, frames_received=0, last_error=None)
+
+        assert "accepted the connection" in message
+        assert "open the camera" in message
+
+    def test_listening_but_never_produced_a_frame_blames_the_camera(self):
+        message = self._message(
+            connected=False, frames_received=0,
+            last_error="ReadTimeout for http://camera.invalid:56000/mjpeg",
+            last_error_kind="timeout",
+        )
+
+        assert "not produced a single frame" in message
+        assert "open the camera" in message
+
+    def test_an_error_is_carried_verbatim(self):
+        message = self._message(
+            connected=False, frames_received=0,
+            last_error="ConnectError: All connection attempts failed",
+            last_error_kind="transport",
+        )
+
+        assert "ConnectError" in message
+        assert "open the camera" not in message
+
+    def test_frames_then_silence_points_at_cam2ips_log(self):
+        message = self._message(
+            connected=True, frames_received=100, frame=b"x", frame_at=0.0,
+            last_error=None,
+        )
+
+        assert "stopped sending frames" in message
+        assert "log" in message
+
+
+class TestNoCameraAtAll:
+    """The most common way a first run is misconfigured, so the message matters.
+
+    cam2ip writes no response headers until it has a frame for the first part, so
+    a cam2ip that cannot open the camera leaves us timing out without ever seeing
+    a status line. Reporting that as a bare "(last error: ReadTimeout)" sends the
+    reader to look at the network, which is the wrong place.
+    """
+
+    async def test_error_blames_the_camera_not_the_network(self, source_factory):
+        async with running_fake_cam2ip(stall_headers=True) as fake:
+            source = source_factory(
+                fake.base_url, http_timeout_s=0.3, grab_timeout_s=1.0
+            )
+
+            with pytest.raises(FrameUnavailable) as excinfo:
+                await source.grab()
+
+        message = str(excinfo.value)
+        assert "cannot open the camera" in message, message
+        assert "--device=/dev/video0" in message, message
+
+    async def test_a_refused_connection_is_not_blamed_on_the_camera(self, source_factory):
+        """The other side of it: nothing listening is an address problem.
+
+        Deliberately uses a short deadline, because that is the case that used to
+        misreport. How fast a refused connect surfaces is platform-dependent --
+        microseconds on Linux, about a second on Windows -- so on a slow one the
+        deadline can expire before any error exists, and the message must still
+        not invent a camera fault.
+        """
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.0)
+
+        with pytest.raises(FrameUnavailable) as excinfo:
+            await source.grab()
+
+        message = str(excinfo.value)
+        assert "cannot open the camera" not in message, message
+        assert "accepted the connection" not in message, message
+        assert "/dev/video0" not in message, message
+        assert self._names_the_address_or_the_error(message), message
+
+    @staticmethod
+    def _names_the_address_or_the_error(message: str) -> bool:
+        """Either the underlying error, or an honest "we do not know yet"."""
+        return "last error" in message or "CAM2IP_BASE_URL" in message
+
+    async def test_carries_the_connection_error_once_it_surfaces(self, source_factory):
+        """Given long enough for the connect to actually fail, say why.
+
+        The deadline has to clear the slowest platform's refusal latency, which is
+        why this is not the one-second case above.
+        """
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=5.0)
+
+        with pytest.raises(FrameUnavailable) as excinfo:
+            await source.grab()
+
+        message = str(excinfo.value)
+        assert "last error" in message, message
+        assert "cannot open the camera" not in message, message
+
+
+class TestFailureModes:
+    async def test_reports_a_useful_error_when_cam2ip_is_down(self, source_factory):
+        # Long enough for a refused connect to surface on any platform; a short
+        # deadline is covered separately, where the point is that it must not
+        # guess at a cause it does not have yet.
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=5.0)
+
+        with pytest.raises(FrameUnavailable) as excinfo:
+            await source.grab()
+
+        message = str(excinfo.value)
+        assert "no frame newer than" in message
+        assert "last error" in message  # carries the connection failure
+
+    async def test_reports_a_useful_error_when_mjpeg_is_unavailable(self, source_factory):
+        async with running_fake_cam2ip(mjpeg_status=404) as fake:
+            source = source_factory(fake.base_url, grab_timeout_s=1.0)
+
+            with pytest.raises(FrameUnavailable) as excinfo:
+                await source.grab()
+
+            assert "404" in str(excinfo.value)
+
+    async def test_gives_up_immediately_on_an_error_a_retry_cannot_fix(self, source_factory):
+        """A 404 will still be a 404 at the deadline, so do not make callers wait."""
+        async with running_fake_cam2ip(mjpeg_status=404) as fake:
+            source = source_factory(fake.base_url, grab_timeout_s=30.0)
+
+            started = time.monotonic()
+            with pytest.raises(FrameUnavailable, match="404"):
+                await source.grab()
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"waited {elapsed:.1f}s for an answer that could not change"
+        assert source.status()["last_error_is_permanent"] is True
+
+    async def test_keeps_retrying_an_error_a_retry_might_fix(self, source_factory):
+        """A refused connection may be cam2ip still starting, so ride it out."""
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.5)
+
+        started = time.monotonic()
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 1.4, f"gave up after {elapsed:.2f}s instead of waiting out the deadline"
+        assert source.status()["last_error_is_permanent"] is False
+
+    async def test_a_fixed_endpoint_is_retried_rather_than_written_off(self, fake_cam, source_factory):
+        """A permanent verdict must not outlive the pump that reached it.
+
+        While that pump is alive the verdict is legitimately current -- its retry
+        loop keeps re-testing the endpoint -- so this waits for it to go idle
+        first. That is the boundary being asserted: a *new* pump starts clean.
+        """
+        source = source_factory(fake_cam.base_url, grab_timeout_s=5.0, stream_idle_s=0.0)
+
+        fake_cam.mjpeg_status = 404
+        with pytest.raises(FrameUnavailable, match="404"):
+            await source.grab()
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+        assert source.status()["stream_running"] is False
+
+        # Whatever was wrong has been put right; the next grab must try again.
+        fake_cam.mjpeg_status = 200
+        frame = await source.grab()
+        assert frame.data.startswith(b"\xff\xd8")
+        assert source.status()["last_error_is_permanent"] is False
+
+    async def test_a_still_failing_endpoint_is_re_tested_by_the_retry_loop(self, fake_cam, source_factory):
+        """And while the pump lives, a fix is picked up within one backoff."""
+        source = source_factory(fake_cam.base_url, grab_timeout_s=5.0, stream_idle_s=30.0)
+
+        fake_cam.mjpeg_status = 404
+        with pytest.raises(FrameUnavailable, match="404"):
+            await source.grab()
+        assert source.status()["stream_running"] is True
+
+        # No restart, no new grab: the running pump's own retry should notice.
+        fake_cam.mjpeg_status = 200
+        for _ in range(200):
+            if not source.status()["last_error_is_permanent"]:
+                break
+            await asyncio.sleep(0.05)
+
+        assert source.status()["last_error_is_permanent"] is False
+        assert (await source.grab()).data.startswith(b"\xff\xd8")
+
+
+class TestIdleWhileFailing:
+    async def test_stops_reconnecting_once_nothing_is_waiting(self, source_factory):
+        """The retry loop has to honour the idle timeout like the read loop does.
+
+        Otherwise it is the one path that never checks, and a stream that cannot
+        be established -- a wrong base URL, say -- reconnects every couple of
+        seconds for the life of the process, long after the request that started
+        it gave up.
+        """
+        source = source_factory(
+            "http://127.0.0.1:1", grab_timeout_s=0.5, stream_idle_s=0.2
+        )
+
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        assert source.status()["stream_running"] is True, "should still be retrying"
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+
+        assert source.status()["stream_running"] is False, (
+            "pump kept reconnecting with nobody waiting for a frame"
+        )
+
+    @pytest.mark.parametrize(
+        "grab_timeout_s,stream_idle_s",
+        [
+            (1.5, 0.0),  # zero idle timeout
+            (4.0, 0.3),  # grab timeout well above the idle timeout
+        ],
+    )
+    async def test_keeps_reconnecting_while_a_grab_is_waiting(
+        self, source_factory, grab_timeout_s, stream_idle_s
+    ):
+        """Idle means nobody waiting -- an in-flight grab must hold it open.
+
+        Both orderings are covered on purpose. It would be easy to assume the
+        default grab_timeout_s (15s) being under stream_idle_s (30s) is what
+        stops a waiter being starved, and to then "document" that as a
+        constraint. It is not: the _waiters guard is, so inverting the two is
+        safe and stays safe.
+        """
+        source = source_factory(
+            "http://127.0.0.1:1",
+            grab_timeout_s=grab_timeout_s,
+            stream_idle_s=stream_idle_s,
+        )
+
+        async def watch_while_waiting() -> list[bool]:
+            seen = []
+            for _ in range(6):
+                await asyncio.sleep(0.2)
+                seen.append(bool(source.status()["stream_running"]))
+            return seen
+
+        grab = asyncio.ensure_future(source.grab())
+        running = await watch_while_waiting()
+        with pytest.raises(FrameUnavailable):
+            await grab
+
+        # Alive at every sample, not merely at one of them: the guarantee is that
+        # it never gives up under a waiter, not that it lingers a while first.
+        assert all(running), f"pump gave up while a grab was still waiting: {running}"
+
+    async def test_recovers_after_the_stream_drops(self, fake_cam, source_factory):
+        """A dropped connection must reconnect, not wedge."""
+        source = source_factory(fake_cam.base_url, frame_max_age_s=0.2)
+        await source.grab()
+
+        # Kill the pump the way a network blip would.
+        source._task.cancel()  # noqa: SLF001 - simulating an abrupt stream loss
+        await asyncio.sleep(0.5)
+
+        stale_high_water = await fake_cam.queue.wait_until_stalled()
+        meta = read_frame_meta((await source.grab()).data)
+        assert meta["seq"] > stale_high_water
+
+    async def test_concurrent_grabs_all_get_a_fresh_frame(self, fake_cam, source_factory):
+        await asyncio.sleep(0.5)
+        stale_high_water = fake_cam.queue.captured
+        source = source_factory(fake_cam.base_url)
+
+        frames = await asyncio.gather(*(source.grab() for _ in range(5)))
+
+        assert fake_cam.mjpeg_connections == 1
+        for frame in frames:
+            assert read_frame_meta(frame.data)["seq"] > stale_high_water
+
+    async def test_grab_rejects_a_negative_max_age(self, fake_cam, source_factory):
+        source = source_factory(fake_cam.base_url)
+        # max_age of 0 means "must have arrived after I asked", which is valid.
+        frame = await source.grab(max_age_s=0.0)
+        assert frame.data
+
+
+class TestRepeatedReconnectCycles:
+    """Each idle drop closes the camera and tears down the pump task.
+
+    An 80-cycle soak on real hardware held file descriptors flat at 8 -- the same
+    three sockets, two pipes, eventpoll, stdin and /dev/null at the end as at the
+    start. That is the result worth defending: a descriptor leaked per cycle is
+    what eventually kills a container that is meant to run for months, and it
+    would not show up in any of the single-cycle tests above.
+    """
+
+    @staticmethod
+    def _open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    @staticmethod
+    async def _wait_for_stop(source: FrameSource) -> None:
+        for _ in range(400):
+            if not source.status()["stream_running"]:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("stream did not shut down between cycles")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="needs /proc/self/fd")
+    async def test_does_not_leak_file_descriptors(self, fake_cam, source_factory):
+        # idle_s=0 drops the subscription right after each publish and max_age=0
+        # refuses the cached frame, so every grab is a full reconnect.
+        source = source_factory(
+            fake_cam.base_url,
+            stream_idle_s=0.0,
+            frame_max_age_s=0.0,
+            warmup_frames=1,
+            warmup_s=0.0,
+        )
+
+        # Let the connection pool and allocator reach steady state first; the
+        # soak showed the interesting slope is after warm-up, not during it.
+        for _ in range(5):
+            await source.grab()
+            await self._wait_for_stop(source)
+
+        before = self._open_fds()
+        for _ in range(40):
+            await source.grab()
+            await self._wait_for_stop(source)
+        after = self._open_fds()
+
+        assert fake_cam.mjpeg_connections >= 45, "cycles did not actually reconnect"
+        assert after <= before, (
+            f"leaked {after - before} descriptors across 40 reconnect cycles"
+        )
+
+
+class TestStatusDuringACameraOutage:
+    """A camera that vanishes leaves the HTTP link to cam2ip perfectly alive.
+
+    cam2ip holds the response open and simply stops writing parts, so
+    stream_connected and stream_running both stay true through a total outage.
+    Read on their own they say "fine" while nothing works, which is why status
+    leads with a state field instead.
+    """
+
+    async def test_state_says_connected_but_no_frames(self, fake_cam, source_factory):
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.5, grab_timeout_s=1.0, stream_idle_s=30.0
+        )
+        await source.grab()
+        assert source.status()["state"] == "streaming"
+
+        fake_cam.go_silent()
+        await asyncio.sleep(1.0)  # longer than http_timeout_s, so frames are overdue
+        status = source.status()
+
+        assert status["state"] == "connected_but_no_frames"
+        # The misleading pair, still true about what it measures.
+        assert status["stream_connected"] is True
+        assert status["stream_running"] is True
+
+    async def test_error_names_the_timeout_without_a_dangling_colon(
+        self, fake_cam, source_factory
+    ):
+        """httpx2 timeouts stringify to nothing, so "ReadTimeout: " was all it said."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.5, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        error = source.status()["last_error"]
+        assert error, "no error recorded for a stream that went silent"
+        assert not error.rstrip().endswith(":"), f"dangling colon in {error!r}"
+        assert "Timeout" in error
+        assert "/mjpeg" in error, f"expected the URL in {error!r}"
+
+    async def test_grab_error_points_at_cam2ips_own_log(self, fake_cam, source_factory):
+        """This layer cannot tell an absent camera from a slow one; cam2ip can."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.0, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+
+        with pytest.raises(FrameUnavailable, match="stopped sending frames"):
+            await source.grab()
+
+    async def test_recovers_when_frames_resume(self, fake_cam, source_factory):
+        """The replug case: no restart, no intervention."""
+        source = source_factory(
+            fake_cam.base_url, http_timeout_s=0.3, grab_timeout_s=1.0, frame_max_age_s=0.2
+        )
+        await source.grab()
+        fake_cam.go_silent()
+        await asyncio.sleep(0.4)  # past frame_max_age_s, so memory cannot answer
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        fake_cam.silent = False
+        frame = await source.grab()
+
+        assert frame.data.startswith(b"\xff\xd8")
+        assert source.status()["state"] == "streaming"
+
+
+class TestStatus:
+    @pytest.mark.parametrize(
+        "expected", ["idle", "streaming"]
+    )
+    async def test_state_tracks_the_lifecycle(self, fake_cam, source_factory, expected):
+        source = source_factory(fake_cam.base_url, stream_idle_s=30.0)
+        if expected == "streaming":
+            await source.grab()
+        assert source.status()["state"] == expected
+
+    async def test_status_does_not_wake_the_stream(self, fake_cam, source_factory):
+        """Diagnostics must not disturb what they are measuring.
+
+        Checking idle depth is one of the main uses of this tool, and it would be
+        useless -- worse, misleading -- if asking reopened the camera and reset
+        the counters. It holds because status() only reads; this keeps it that
+        way.
+        """
+        source = source_factory(fake_cam.base_url, stream_idle_s=0.0)
+        await source.grab()
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+        assert source.status()["stream_running"] is False
+
+        frozen = source.status()["frames_received"]
+        for _ in range(10):
+            source.status()
+            await asyncio.sleep(0.02)
+
+        assert source.status()["frames_received"] == frozen
+        assert source.status()["stream_running"] is False
+        assert fake_cam.mjpeg_connections == 1
+
+    async def test_status_reports_the_stream(self, fake_cam, source_factory):
+        source = source_factory(fake_cam.base_url)
+        assert source.status()["stream_connected"] is False
+
+        await source.grab()
+        status = source.status()
+
+        assert status["stream_connected"] is True
+        assert status["frames_received"] > status["frames_published"] > 0
+        assert status["last_frame_age_s"] < 1.0
+        assert status["last_error"] is None
+        assert status["cam2ip_url"] == fake_cam.base_url
