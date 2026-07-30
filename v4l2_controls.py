@@ -491,8 +491,23 @@ class CameraControls:
         return bool(self._original)
 
     def changed(self) -> dict[str, int]:
-        """Controls written since the last restore, and the values to put back."""
-        catalog = self.catalog()
+        """Controls written since the last restore, and the values to put back.
+
+        Deliberately never opens the device. This is what camera_status reports,
+        and status has to keep working when the controls do not -- a node that
+        exists but cannot be opened (the process is not in the `video` group, say)
+        must not stop the server describing a stream that is reaching the camera
+        over HTTP and is perfectly healthy.
+
+        It gets that for free rather than by catching anything. With nothing
+        written there are no ids to name, so there is nothing to look up; and
+        anything written means a set() already succeeded, which means it already
+        enumerated and the catalog is cached. Either way the ioctl path is not
+        reached.
+        """
+        if not self._original:
+            return {}
+        catalog = self._catalog or {}
         return {
             catalog[cid].slug if cid in catalog else f"0x{cid:08x}": value
             for cid, value in self._original.items()

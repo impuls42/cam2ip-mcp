@@ -94,3 +94,54 @@ class TestFrameSize:
         """Used by camera_status, where a frame that cannot be parsed should cost
         one field rather than the whole status call."""
         assert frame_size(b"not a jpeg at all") is None
+
+
+class TestValidationHappensBeforeTheCamera:
+    """A region that cannot work must be refused without touching the camera.
+
+    Every check is arithmetic on fractions, so none of it needs a frame. Doing it
+    late would mean a doomed call still woke the stream and pushed back the
+    control-restore timer before failing.
+    """
+
+    @pytest.mark.parametrize(
+        "region",
+        [
+            [0, 0, 2, 2],          # width and height out of range
+            [0.8, 0, 0.5, 0.5],    # runs off the right edge
+            [0.5, 0.5],            # wrong number of coordinates
+            [0, 0, 0, 0.5],        # zero width
+            [-0.1, 0, 0.5, 0.5],   # negative origin
+        ],
+    )
+    def test_rejected_without_a_frame(self, region):
+        from cam2mcp_server import validate_region
+
+        with pytest.raises(ValueError):
+            validate_region(region)
+
+    def test_a_good_region_comes_back_as_a_box(self):
+        from cam2mcp_server import validate_region
+
+        assert validate_region([0.5, 0.0, 0.25, 0.75]) == (0.5, 0.0, 0.25, 0.75)
+
+    async def test_grab_frame_refuses_before_reaching_the_camera(self, monkeypatch):
+        """The claim worth pinning is not that validate_region rejects -- it is
+        that grab_frame consults it *first*. Validating after the grab would
+        still raise the same error, having already woken the stream and pushed
+        back the control-restore timer."""
+        import cam2mcp_server
+
+        grabs = []
+
+        class NeverCalled:
+            async def grab(self, max_age_s=None):
+                grabs.append(max_age_s)
+                raise AssertionError("the camera was touched for a doomed region")
+
+        monkeypatch.setattr(cam2mcp_server, "source", NeverCalled)
+
+        with pytest.raises(ValueError, match="runs past the edge"):
+            await cam2mcp_server.grab_frame(region=[0.8, 0.0, 0.5, 0.5])
+
+        assert grabs == []

@@ -295,3 +295,62 @@ class TestReadOnlyControls:
 
         with pytest.raises(CameraControlError, match="read-only"):
             controls.set("gain", 50)
+
+
+class TestStatusSurvivesAnUnopenableDevice:
+    """camera_status must answer even when the controls cannot.
+
+    The frame path reaches the camera through cam2ip over HTTP and needs no
+    device node of its own, so a node that exists but will not open -- the
+    process is not in the `video` group, most often -- leaves grab_frame working
+    perfectly. Status is where someone goes when things look wrong, and it is no
+    use if the broken subsystem takes it down too.
+    """
+
+    @pytest.fixture
+    def unopenable(self, monkeypatch, tmp_path):
+        device = tmp_path / "video0"
+        device.write_bytes(b"")
+        controls = CameraControls(str(device))
+
+        def refuse(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(v4l2.os, "open", refuse)
+        return controls
+
+    def test_changed_does_not_open_the_device(self, unopenable):
+        assert unopenable.changed() == {}
+
+    def test_session_status_still_reports(self, unopenable):
+        session = ControlSession(unopenable, idle_s=0.0)
+
+        status = session.status()
+
+        assert status["changed_by_this_server"] is None
+        assert status["device"] == unopenable.device
+
+    def test_the_tools_themselves_still_say_why(self, unopenable):
+        """Reporting is what has to survive; actually driving the camera cannot,
+        and should say so rather than pretend."""
+        with pytest.raises(CameraControlError, match="no permission"):
+            unopenable.get_all()
+
+    async def test_camera_status_reports_the_error_as_a_field(self, monkeypatch, tmp_path):
+        """If anything does raise, it becomes a field rather than a failed call."""
+        import cam2mcp_server
+
+        class Broken:
+            device = "/dev/video0"
+
+            def status(self):
+                raise CameraControlError("device fell off the bus")
+
+        monkeypatch.setattr(cam2mcp_server, "_controls", Broken())
+        monkeypatch.setattr(cam2mcp_server, "controls", lambda: Broken())
+        monkeypatch.setattr(cam2mcp_server, "controls_available", lambda: True)
+
+        status = await cam2mcp_server.camera_status()
+
+        assert status["controls"] == {"error": "device fell off the bus"}
+        assert "state" in status  # the stream half still reported

@@ -753,6 +753,35 @@ def frame_size(data: bytes) -> tuple[int, int] | None:
         return None
 
 
+def validate_region(region: list[float]) -> tuple[float, float, float, float]:
+    """Check a region and return it as a tuple, without needing a frame.
+
+    Separate from crop_jpeg because every one of these checks is arithmetic on
+    fractions -- none of them needs to know how big the picture is. That means
+    the whole thing can be settled before a frame is fetched, so a region that
+    was never going to work does not first wake the camera and push back the
+    control-restore timer on its way to failing.
+    """
+    if len(region) != 4:
+        raise ValueError(
+            f"region takes exactly 4 numbers -- [x, y, width, height] as "
+            f"fractions of the frame -- got {len(region)}"
+        )
+
+    left, top, width, height = region
+    for name, value in zip(("x", "y", "width", "height"), region):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"region {name}={value} must be between 0 and 1")
+    if width <= 0 or height <= 0:
+        raise ValueError("region width and height must be greater than 0")
+    if left + width > 1.0 or top + height > 1.0:
+        raise ValueError(
+            f"region [{left}, {top}, {width}, {height}] runs past the edge of the "
+            f"frame: x+width and y+height must each be at most 1"
+        )
+    return left, top, width, height
+
+
 def crop_jpeg(data: bytes, region: tuple[float, float, float, float], quality: int) -> bytes:
     """Return the given fraction of a JPEG, re-encoded.
 
@@ -772,17 +801,10 @@ def crop_jpeg(data: bytes, region: tuple[float, float, float, float], quality: i
 
     import io
 
-    left, top, width, height = region
-    for name, value in zip(("x", "y", "width", "height"), region):
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"region {name}={value} must be between 0 and 1")
-    if width <= 0 or height <= 0:
-        raise ValueError("region width and height must be greater than 0")
-    if left + width > 1.0 or top + height > 1.0:
-        raise ValueError(
-            f"region [{left}, {top}, {width}, {height}] runs past the edge of the "
-            f"frame: x+width and y+height must each be at most 1"
-        )
+    # Revalidated rather than trusted. grab_frame has already done this, before
+    # fetching a frame, but this is a module-level function and the checks are
+    # cheap next to a decode.
+    left, top, width, height = validate_region(list(region))
 
     with PILImage.open(io.BytesIO(data)) as image:
         source_w, source_h = image.size
@@ -1084,11 +1106,9 @@ async def grab_frame(
     """
     if max_age_s is not None and max_age_s < 0:
         raise ValueError("max_age_s must be >= 0")
-    if region is not None and len(region) != 4:
-        raise ValueError(
-            f"region takes exactly 4 numbers -- [x, y, width, height] as "
-            f"fractions of the frame -- got {len(region)}"
-        )
+    # Fully checked before the camera is touched: a bad region would otherwise
+    # wake the stream and defer the control-restore timer on its way to raising.
+    box = validate_region(region) if region is not None else None
 
     frame = await source().grab(max_age_s)
     # A frame grab is camera activity, so it defers the automatic restore of any
@@ -1098,13 +1118,11 @@ async def grab_frame(
 
     data = frame.data
     subtype = frame.content_type.partition("/")[2] or "jpeg"
-    if region is not None:
+    if box is not None:
         # Off the event loop: decoding and re-encoding a 4K frame is tens of
         # milliseconds of pure CPU, which is long enough to stutter the MJPEG
         # pump keeping frames fresh for everyone else.
-        data = await asyncio.to_thread(
-            crop_jpeg, data, (region[0], region[1], region[2], region[3]), CROP_QUALITY
-        )
+        data = await asyncio.to_thread(crop_jpeg, data, box, CROP_QUALITY)
         subtype = "jpeg"
     return Image(data=data, format=subtype)
 
@@ -1124,7 +1142,15 @@ async def camera_status() -> dict[str, object]:
     status["frame_size"] = f"{size[0]}x{size[1]}" if size else None
 
     if controls_available():
-        status["controls"] = controls().status()
+        # Belt and braces. changed() is written not to touch the device at all,
+        # so this should not fire -- but camera_status is where someone goes when
+        # things are already broken, and it earns its keep by answering rather
+        # than by being the second thing that fails. A control subsystem that
+        # cannot report becomes a field, not an exception.
+        try:
+            status["controls"] = controls().status()
+        except CameraControlError as exc:
+            status["controls"] = {"error": str(exc)}
     return status
 
 
