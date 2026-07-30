@@ -99,7 +99,9 @@ So the server does not take one-shot snapshots. Instead:
 The subscription is dropped once nothing has asked for a frame in
 `MCP_STREAM_IDLE_S` seconds, so the camera is released — and its indicator light
 goes out — while the server is idle. The next request re-establishes it, paying
-the warm-up cost once.
+the warm-up cost once. That timeout applies while reconnecting too, so a stream
+that cannot be established does not retry forever after the request that wanted
+it has given up.
 
 `CAM2IP_TIMESTAMP` is on by default, so each frame carries its time in the top
 left corner and freshness can be read straight off the picture. Note that
@@ -176,6 +178,10 @@ which is why every log line from both the entrypoint and cam2ip goes to stderr.
 `camera_status` takes none, and reports whether the stream is connected, how
 many frames have been received and published, the age of the frame in memory,
 and the last error — which is where to look first if `grab_frame` is failing.
+`last_error_is_permanent` distinguishes the two kinds: a refused connection or a
+timeout is worth retrying and gets ridden out until `MCP_GRAB_TIMEOUT_S`, while a
+4xx or a response that is not MJPEG at all cannot be fixed by reconnecting, so
+`grab_frame` reports it immediately instead of making the caller wait.
 
 ## cam2ip's own interface
 

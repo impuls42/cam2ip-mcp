@@ -17,8 +17,10 @@ import sys
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
+import httpx2
 import pytest
 from mcp import Client, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 
 from fake_cam2ip import read_frame_meta, running_fake_cam2ip
@@ -68,8 +70,12 @@ async def http_session(base_url: str, *, mode: str = "streamable-http", **overri
     )
     try:
         await _wait_for_port(port, process)
-        async with Client(f"http://127.0.0.1:{port}/mcp") as client:
-            yield client
+        if mode == "sse":
+            async with Client(sse_client(f"http://127.0.0.1:{port}/sse")) as client:
+                yield client
+        else:
+            async with Client(f"http://127.0.0.1:{port}/mcp") as client:
+                yield client
     finally:
         process.terminate()
         try:
@@ -180,6 +186,44 @@ class TestStreamableHttp:
                     await asyncio.sleep(0.3)
 
         assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+
+
+class TestSse:
+    """The legacy transport. Advertised in the README, so it has to work.
+
+    Its wiring differs from Streamable HTTP -- a separate endpoint pair, and its
+    own transport_security path -- so it can regress independently.
+    """
+
+    async def test_grab_frame_returns_a_fresh_image(self):
+        async with running_fake_cam2ip() as fake:
+            watermark = await fake.queue.wait_until_stalled()
+            await asyncio.sleep(0.4)
+
+            async with http_session(fake.base_url, mode="sse") as client:
+                tools = {tool.name for tool in (await client.list_tools()).tools}
+                result = await client.call_tool("grab_frame", {})
+
+        assert tools == {"grab_frame", "camera_status"}
+        assert not result.is_error, result.content
+        meta = read_frame_meta(image_bytes(result))
+        assert meta["seq"] > watermark
+
+    async def test_honours_a_host_allowlist(self):
+        """MCP_ALLOWED_HOSTS reaches the SSE transport, not just streamable-http.
+
+        Rejection lands on the transport, before a session exists: the server
+        answers the connect with 421 rather than letting a call through to fail.
+        """
+        async with running_fake_cam2ip() as fake:
+            with pytest.raises(httpx2.HTTPStatusError) as excinfo:
+                async with http_session(
+                    fake.base_url, mode="sse", MCP_ALLOWED_HOSTS="example.invalid"
+                ) as client:
+                    await client.call_tool("grab_frame", {})
+
+        # The client connects as 127.0.0.1, which the allowlist excludes.
+        assert excinfo.value.response.status_code == 421
 
 
 class TestBadConfiguration:

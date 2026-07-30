@@ -231,6 +231,20 @@ class FrameUnavailable(RuntimeError):
     """No sufficiently fresh frame could be obtained."""
 
 
+def _is_permanent(exc: BaseException) -> bool:
+    """Whether an error will still be an error after a retry.
+
+    A refused connection or a timeout is worth retrying -- cam2ip may still be
+    starting, or the camera may be waking up. A 4xx or a response that is not
+    multipart at all means we are asking the wrong thing of the wrong endpoint,
+    and no amount of reconnecting changes that.
+    """
+    if isinstance(exc, httpx2.HTTPStatusError):
+        return 400 <= exc.response.status_code < 500
+    # Raised by this module for a non-multipart response or an unparseable stream.
+    return isinstance(exc, ValueError)
+
+
 @dataclass(frozen=True)
 class Frame:
     data: bytes
@@ -265,6 +279,7 @@ class FrameSource:
         self._frames_received = 0
         self._frames_published = 0
         self._last_error: str | None = None
+        self._permanent_error: str | None = None
 
     # -- public API --------------------------------------------------------
 
@@ -290,6 +305,17 @@ class FrameSource:
                         data=self._frame,
                         content_type=self._content_type,
                         age_s=max(0.0, time.monotonic() - self._frame_at),
+                    )
+
+                # A running pump that has hit something a retry cannot fix -- a
+                # 404, an endpoint that is not MJPEG -- will still be failing
+                # when the deadline expires, so say so now rather than making
+                # the caller wait out grab_timeout_s for the same answer. Only
+                # while that pump is alive: once it exits, the next grab starts
+                # a fresh one and is entitled to a fresh verdict.
+                if self._task is not None and self._permanent_error is not None:
+                    raise FrameUnavailable(
+                        f"cannot get frames from {self._mjpeg_url}: {self._permanent_error}"
                     )
 
                 self._start_pump_locked()
@@ -323,6 +349,7 @@ class FrameSource:
             "warmup_s": self._config.warmup_s,
             "stream_idle_s": self._config.stream_idle_s,
             "last_error": self._last_error,
+            "last_error_is_permanent": self._permanent_error is not None,
         }
 
     async def aclose(self) -> None:
@@ -344,6 +371,9 @@ class FrameSource:
     def _start_pump_locked(self) -> None:
         """Start the MJPEG pump if it is not running. Caller holds self._cond."""
         if self._task is None and not self._closed:
+            # A new attempt earns a new verdict: whatever was unfixable last
+            # time may have been fixed since.
+            self._permanent_error = None
             self._task = asyncio.create_task(self._pump(), name="cam2ip-frame-pump")
 
     async def _pump(self) -> None:
@@ -358,7 +388,18 @@ class FrameSource:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - reported via status
-                    await self._set_error(f"{type(exc).__name__}: {exc}")
+                    await self._set_error(f"{type(exc).__name__}: {exc}", permanent=_is_permanent(exc))
+
+                    # Reconnecting has to honour the idle timeout too. Without
+                    # this the retry loop is the one path that never checks, so
+                    # a stream that cannot be established (wrong base URL, say)
+                    # would retry every 2s for the life of the process, long
+                    # after the request that started it gave up.
+                    if await self._should_go_idle():
+                        log.info("no frame requested in %.1fs, giving up on reconnecting",
+                                 self._config.stream_idle_s)
+                        return
+
                     backoff = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
                     attempt += 1
                     await asyncio.sleep(backoff)
@@ -443,11 +484,19 @@ class FrameSource:
                 return False
             return time.monotonic() - self._last_grab_at > self._config.stream_idle_s
 
-    async def _set_error(self, message: str | None) -> None:
+    async def _set_error(self, message: str | None, permanent: bool = False) -> None:
         if message:
             log.warning("stream error: %s", message)
         async with self._cond:
             self._last_error = message
+            if message is None:
+                self._permanent_error = None
+            elif permanent:
+                self._permanent_error = message
+            # Waiting grabbers are blocked on this condition, so wake them when
+            # what they are waiting on changes. A permanent failure means they
+            # should stop waiting at once; a transient one costs them a re-check.
+            self._cond.notify_all()
 
     def _timeout_message(self, max_age: float) -> str:
         detail = (

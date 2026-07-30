@@ -212,6 +212,123 @@ class TestFailureModes:
 
             assert "404" in str(excinfo.value)
 
+    async def test_gives_up_immediately_on_an_error_a_retry_cannot_fix(self, source_factory):
+        """A 404 will still be a 404 at the deadline, so do not make callers wait."""
+        async with running_fake_cam2ip(mjpeg_status=404) as fake:
+            source = source_factory(fake.base_url, grab_timeout_s=30.0)
+
+            started = time.monotonic()
+            with pytest.raises(FrameUnavailable, match="404"):
+                await source.grab()
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0, f"waited {elapsed:.1f}s for an answer that could not change"
+        assert source.status()["last_error_is_permanent"] is True
+
+    async def test_keeps_retrying_an_error_a_retry_might_fix(self, source_factory):
+        """A refused connection may be cam2ip still starting, so ride it out."""
+        source = source_factory("http://127.0.0.1:1", grab_timeout_s=1.5)
+
+        started = time.monotonic()
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+        elapsed = time.monotonic() - started
+
+        assert elapsed >= 1.4, f"gave up after {elapsed:.2f}s instead of waiting out the deadline"
+        assert source.status()["last_error_is_permanent"] is False
+
+    async def test_a_fixed_endpoint_is_retried_rather_than_written_off(self, fake_cam, source_factory):
+        """A permanent verdict must not outlive the pump that reached it.
+
+        While that pump is alive the verdict is legitimately current -- its retry
+        loop keeps re-testing the endpoint -- so this waits for it to go idle
+        first. That is the boundary being asserted: a *new* pump starts clean.
+        """
+        source = source_factory(fake_cam.base_url, grab_timeout_s=5.0, stream_idle_s=0.0)
+
+        fake_cam.mjpeg_status = 404
+        with pytest.raises(FrameUnavailable, match="404"):
+            await source.grab()
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+        assert source.status()["stream_running"] is False
+
+        # Whatever was wrong has been put right; the next grab must try again.
+        fake_cam.mjpeg_status = 200
+        frame = await source.grab()
+        assert frame.data.startswith(b"\xff\xd8")
+        assert source.status()["last_error_is_permanent"] is False
+
+    async def test_a_still_failing_endpoint_is_re_tested_by_the_retry_loop(self, fake_cam, source_factory):
+        """And while the pump lives, a fix is picked up within one backoff."""
+        source = source_factory(fake_cam.base_url, grab_timeout_s=5.0, stream_idle_s=30.0)
+
+        fake_cam.mjpeg_status = 404
+        with pytest.raises(FrameUnavailable, match="404"):
+            await source.grab()
+        assert source.status()["stream_running"] is True
+
+        # No restart, no new grab: the running pump's own retry should notice.
+        fake_cam.mjpeg_status = 200
+        for _ in range(200):
+            if not source.status()["last_error_is_permanent"]:
+                break
+            await asyncio.sleep(0.05)
+
+        assert source.status()["last_error_is_permanent"] is False
+        assert (await source.grab()).data.startswith(b"\xff\xd8")
+
+
+class TestIdleWhileFailing:
+    async def test_stops_reconnecting_once_nothing_is_waiting(self, source_factory):
+        """The retry loop has to honour the idle timeout like the read loop does.
+
+        Otherwise it is the one path that never checks, and a stream that cannot
+        be established -- a wrong base URL, say -- reconnects every couple of
+        seconds for the life of the process, long after the request that started
+        it gave up.
+        """
+        source = source_factory(
+            "http://127.0.0.1:1", grab_timeout_s=0.5, stream_idle_s=0.2
+        )
+
+        with pytest.raises(FrameUnavailable):
+            await source.grab()
+
+        assert source.status()["stream_running"] is True, "should still be retrying"
+
+        for _ in range(200):
+            if not source.status()["stream_running"]:
+                break
+            await asyncio.sleep(0.05)
+
+        assert source.status()["stream_running"] is False, (
+            "pump kept reconnecting with nobody waiting for a frame"
+        )
+
+    async def test_keeps_reconnecting_while_a_grab_is_waiting(self, source_factory):
+        """Idle means nobody waiting -- an in-flight grab must hold it open."""
+        source = source_factory(
+            "http://127.0.0.1:1", grab_timeout_s=1.5, stream_idle_s=0.0
+        )
+
+        async def watch_while_waiting() -> list[bool]:
+            seen = []
+            for _ in range(6):
+                await asyncio.sleep(0.2)
+                seen.append(bool(source.status()["stream_running"]))
+            return seen
+
+        grab = asyncio.ensure_future(source.grab())
+        running = await watch_while_waiting()
+        with pytest.raises(FrameUnavailable):
+            await grab
+
+        assert any(running), "pump gave up while a grab was still waiting"
+
     async def test_recovers_after_the_stream_drops(self, fake_cam, source_factory):
         """A dropped connection must reconnect, not wedge."""
         source = source_factory(fake_cam.base_url, frame_max_age_s=0.2)
