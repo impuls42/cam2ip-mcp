@@ -98,14 +98,18 @@ So the server does not take one-shot snapshots. Instead:
    over. Measured drops were 7–8 on both Linux/V4L2 and macOS/AVFoundation at
    30fps — the window doing the work in both cases.
 
-   On the depth it has to beat: `korandiz/v4l` *requests* four buffers, but V4L2
-   lets the driver grant more, and the library maps however many it gets. So four
-   is the common case, not a guarantee — a camera observed walking forward through
-   exactly three stale frames before catching up has a four-deep queue, and one
-   that takes longer has a deeper one. If you meet a driver that queues more than
-   the formula above covers at your frame rate (8 buffers at 15fps, say, where the
-   count binds at 5), raise `MCP_WARMUP_FRAMES` to match. The default pair covers
-   a four-buffer queue at any frame rate with room to spare.
+   On the depth it has to beat: `korandiz/v4l` *requests* four buffers and maps
+   however many the driver grants, checking only that the count is non-zero. V4L2
+   permits a driver to grant more than asked, so in principle the depth is not
+   fixed — but `uvcvideo`, which is what a USB webcam uses, was measured granting
+   exactly the requested count at every value from 1 to 32, with no upward bump.
+   Its depth is therefore pinned at the four requested, independently of frame
+   rate, and the 5-frame floor covers it on its own. Measured directly from
+   `v4l2_buffer.timestamp`: after any stall from 0.5s to 30s, exactly four frames
+   come back stale and the fifth is current, with only their *age* growing.
+
+   If you do meet a driver that inflates the request beyond what the formula
+   covers at your frame rate, raise `MCP_WARMUP_FRAMES` to match.
 3. **It caps the age of what it serves** (`MCP_FRAME_MAX_AGE_S`), waiting for a
    newer frame instead of answering with an old one. This age is measured from
    when a frame *arrived*, because HTTP carries no capture timestamp — so it
@@ -146,6 +150,29 @@ max-age bound still catches a stalled pipeline, and it was observed refusing 15s
 and 71s-old cached frames on macOS. But if you are running on a backend with no
 stale-queue problem and want the cold-start latency back, `MCP_WARMUP_S=0` costs
 you nothing there.
+
+### Reproducing the stale queue, if you want to see it
+
+The queue only holds stale frames while the device stays open, which
+`CAM2IP_LAZY` decides — and the default makes it *harder* to observe, not easier:
+
+- **`CAM2IP_LAZY=false`** keeps the device open indefinitely, so the queue holds
+  four frames from whenever it last drained, however long ago that was. This is
+  the setting under which a snapshot was measured returning a scene 68 seconds
+  old.
+- **`CAM2IP_LAZY=true`** (the default) closes the device about 30 seconds after
+  the last read. Closing frees the buffers, so a reopen captures fresh ones. The
+  queue can still be stale within that window — a snapshot taken 10 seconds after
+  the last one can be 10 seconds old — but wait longer than the hold and the
+  evidence has been cleaned up before you look.
+
+So a reproduction that idles for a minute and then reads `/jpeg` will see nothing
+on the default settings: it is measuring the reopen path. Either set
+`CAM2IP_LAZY=false`, or probe inside the hold window.
+
+None of this changes what the server has to defend against. The warm-up drop is
+sized against the queue depth, which is bounded at four regardless of how long
+the stall ran or which of these two cases produced it.
 
 ## Configuration
 
@@ -347,8 +374,18 @@ Any flag-shaped argument is passed straight to cam2ip, so `--help` and
 ```bash
 git clone --recursive https://github.com/impuls42/cam2ip-mcp.git
 cd cam2ip-mcp
-docker build -f Containerfile -t cam2ip-mcp .
+docker build -f Containerfile -t cam2ip-mcp \
+  --build-arg CAM2IP_VERSION=$(git -C cam2ip rev-parse --short HEAD) .
 ```
+
+**BuildKit is required.** The builder stage uses `--platform=$BUILDPLATFORM` so
+it compiles natively and cross-compiles for the target, which the legacy builder
+cannot parse — it fails with `"" is an invalid OS component`. Any current Docker
+uses BuildKit by default; if yours does not, set `DOCKER_BUILDKIT=1`.
+
+The `--build-arg` is what makes the startup banner report cam2ip's own revision.
+Without it cam2ip falls back to Go's build info, which stamps whichever git tree
+the build ran in — so it would report *this* repo's commit as the cam2ip version.
 
 cam2ip builds with `CGO_ENABLED=0` — it is pure Go now, V4L2 access included —
 so the builder stage runs natively on the build host and cross-compiles for
