@@ -51,3 +51,8 @@ Thumbs.db
 
 # CI/CD (not needed in container)
 .github/
+
+# Tests (not shipped in the image)
+tests/
+pytest.ini
+requirements-dev.txt

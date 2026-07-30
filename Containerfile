@@ -1,28 +1,23 @@
-# Stage 1: Build cam2ip binary
-FROM golang:1.23-alpine AS cam2ip-builder
+# Stage 1: Build the cam2ip binary
+#
+# cam2ip is pure Go now (korandiz/v4l talks to V4L2 through syscalls, and JPEG
+# coding goes through gen2brain/jpegn), so CGO is off: no libjpeg-turbo, no
+# v4l-utils headers, and no emulated cross-compilation for arm64. The old
+# `-tags turbo` build tag no longer exists upstream -- the libjpeg backend is
+# `-tags libjpeg` and needs CGO, which is not worth reintroducing.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS cam2ip-builder
 
-# Install build dependencies
-RUN apk add --no-cache \
-    git \
-    make \
-    build-base \
-    pkgconfig \
-    v4l-utils-dev \
-    libjpeg-turbo-dev \
-    linux-headers
+ARG TARGETARCH
 
 WORKDIR /build
 
-# Copy go.mod and go.sum first for better layer caching
+# Copy go.mod/go.sum first so dependency download caches independently of source.
 COPY cam2ip/go.mod cam2ip/go.sum ./
 RUN go mod download
 
-# Copy the rest of the source code
 COPY cam2ip/ ./
 
-# Build cam2ip with turbo JPEG support
-RUN CGO_ENABLED=1 go build \
-    -tags turbo \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
     -o cam2ip \
     -trimpath \
     -ldflags "-s -w" \
@@ -32,38 +27,38 @@ RUN CGO_ENABLED=1 go build \
 # Stage 2: Final runtime image
 FROM python:3.12-alpine
 
-# Install runtime dependencies
-RUN apk add --no-cache \
-    v4l-utils \
-    libjpeg-turbo \
-    ca-certificates
+# v4l-utils is not needed to capture, but v4l2-ctl earns its keep when a camera
+# will not open and someone has to find out what the device actually supports.
+RUN apk add --no-cache v4l-utils ca-certificates
 
-# Copy cam2ip binary from builder
 COPY --from=cam2ip-builder /build/cam2ip /usr/local/bin/cam2ip
 
-# Set up Python environment
 WORKDIR /app
 
-# Copy and install Python dependencies (separate layer for better caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
 COPY cam2ip_mcp_server.py .
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Expose cam2ip HTTP server + MCP HTTP server ports
+# cam2ip HTTP server + MCP HTTP server
 EXPOSE 56000 3000
 
-# Environment variables with defaults
+# cam2ip reads its own CAM2IP_* variables (the prefix comes from the binary
+# name), so anything it accepts as a flag can be set here or at run time --
+# CAM2IP_WIDTH, CAM2IP_QUALITY, CAM2IP_ROTATE and friends included.
 ENV CAM2IP_ENABLED=true \
     CAM2IP_BASE_URL=http://127.0.0.1:56000 \
     CAM2IP_HTTP_TIMEOUT_S=5.0 \
     CAM2IP_BIND_ADDR=0.0.0.0:56000 \
     CAM2IP_INDEX=0 \
+    CAM2IP_LAZY=true \
     MCP_MODE=stdio \
     MCP_HTTP_HOST=0.0.0.0 \
     MCP_HTTP_PORT=3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/entrypoint.sh", "healthcheck"]
 
 ENTRYPOINT ["/entrypoint.sh"]
