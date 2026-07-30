@@ -101,6 +101,14 @@ The subscription is dropped once nothing has asked for a frame in
 goes out — while the server is idle. The next request re-establishes it, paying
 the warm-up cost once.
 
+`CAM2IP_TIMESTAMP` is on by default, so each frame carries its time in the top
+left corner and freshness can be read straight off the picture. Note that
+cam2ip stamps a frame when it *reads* it out of the buffer queue, not when the
+sensor captured it — which is only the same thing while the pipeline is being
+drained continuously. Under the old snapshot approach the stamp would have read
+as current on an hours-old picture; with the subscription held open the two
+coincide.
+
 ## Configuration
 
 Everything is set through environment variables; see
@@ -121,7 +129,8 @@ supports works without this project knowing about it:
 | `CAM2IP_DELAY` | `10` | Milliseconds between captures |
 | `CAM2IP_ROTATE` | `0` | `90`, `180` or `270` |
 | `CAM2IP_FLIP` | — | `horizontal` or `vertical` |
-| `CAM2IP_TIMESTAMP` | `false` | Draw a timestamp on the image |
+| `CAM2IP_TIMESTAMP` | `true` | Draw the capture time onto the image |
+| `CAM2IP_TIME_FORMAT` | `2006-01-02 15:04:05` | Stamp format, in Go's reference layout |
 | `CAM2IP_LAZY` | `true` | Open the camera only while a client is subscribed |
 | `CAM2IP_BIND_ADDR` | `0.0.0.0:56000` | cam2ip listen address |
 | `CAM2IP_HTPASSWD_FILE` | — | Enable basic auth on cam2ip's endpoints |
