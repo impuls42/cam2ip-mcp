@@ -91,12 +91,21 @@ So the server does not take one-shot snapshots. Instead:
    alone would not flush a queue deeper than it assumes. This also covers a
    camera's auto-exposure ramp.
 
-   The two bounds cover different frame rates, and which one binds is not the one
-   you might expect. At 30fps the 0.25s window is ~7.5 frames, so the *window*
-   decides and the 5-frame count never binds; below about 20fps the count takes
-   over. Measured drops came out at 7–8 on both Linux/V4L2 and macOS/AVFoundation
-   at 30fps, which is the window doing the work in both cases. Either way at
-   least five frames go, comfortably past a four-buffer queue.
+   The number actually dropped is `max(MCP_WARMUP_FRAMES, MCP_WARMUP_S × fps)`,
+   and it has to exceed the driver's queue depth. Which term binds is not the one
+   you might expect: at 30fps the 0.25s window is ~7.5 frames, so the *window*
+   decides and the 5-frame count never does; below about 20fps the count takes
+   over. Measured drops were 7–8 on both Linux/V4L2 and macOS/AVFoundation at
+   30fps — the window doing the work in both cases.
+
+   On the depth it has to beat: `korandiz/v4l` *requests* four buffers, but V4L2
+   lets the driver grant more, and the library maps however many it gets. So four
+   is the common case, not a guarantee — a camera observed walking forward through
+   exactly three stale frames before catching up has a four-deep queue, and one
+   that takes longer has a deeper one. If you meet a driver that queues more than
+   the formula above covers at your frame rate (8 buffers at 15fps, say, where the
+   count binds at 5), raise `MCP_WARMUP_FRAMES` to match. The default pair covers
+   a four-buffer queue at any frame rate with room to spare.
 3. **It caps the age of what it serves** (`MCP_FRAME_MAX_AGE_S`), waiting for a
    newer frame instead of answering with an old one. This age is measured from
    when a frame *arrived*, because HTTP carries no capture timestamp — so it

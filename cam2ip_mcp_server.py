@@ -25,9 +25,12 @@ things do that, and each covers a case the others cannot:
    arriving frame really is a picture of now (lag: queue depth / fps).
 2. Dropping the first frames after each (re)connect. Those are precisely the
    pre-idle ones the queue was sitting on, and they arrive in an instant burst
-   rather than at the frame rate -- so MCP_WARMUP_FRAMES must exceed the
-   driver's buffer count (4 for V4L2 via korandiz/v4l), and MCP_WARMUP_S
-   discards the burst on cameras whose queue is deeper than that.
+   rather than at the frame rate. The number dropped is
+   max(MCP_WARMUP_FRAMES, MCP_WARMUP_S * fps) and has to exceed the driver's
+   queue depth. Note that depth is not fixed: korandiz/v4l asks for four
+   buffers, but V4L2 permits the driver to grant more and the library maps
+   whatever it gets, so four is the common case rather than a guarantee. The
+   time window is what covers a deeper queue at a decent frame rate.
 3. A maximum age on what we hand out. Note this is measured from when a frame
    *arrived*, because HTTP gives us no capture timestamp -- so it cannot detect
    a stale queued frame (see 2), but it does catch a pipeline that stalled or
