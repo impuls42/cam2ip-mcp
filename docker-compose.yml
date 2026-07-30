@@ -29,6 +29,10 @@ services:
     #   device_cgroup_rules: ['c 81:* rmw']
     devices:
       - /dev/video0:/dev/video0
+      # The camera's microphone, for record_audio. Commented out because the
+      # tool is off unless AUDIO_CAPTURE is set, and handing a container the
+      # sound card it will never open is privilege for nothing.
+      # - /dev/snd:/dev/snd
 
     # Published ports follow the same variables the server binds to. Compose
     # reads .env for substitution, so changing a port there moves both sides at

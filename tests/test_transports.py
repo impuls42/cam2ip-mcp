@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 import socket
@@ -40,6 +41,12 @@ def server_env(base_url: str, **overrides) -> dict[str, str]:
         "CAM2IP_BASE_URL": base_url,
         "MCP_GRAB_TIMEOUT_S": "10",
         "MCP_LOG_LEVEL": "WARNING",
+        # Off by default so the advertised tool list does not depend on whether
+        # the machine running the tests happens to have a /dev/video0 -- these
+        # tests are about the frame path and the transports, and a tool list that
+        # differs between a developer's laptop and CI is a flaky assertion
+        # waiting to happen. TestCameraControls turns it back on deliberately.
+        "CAMERA_CONTROLS": "false",
     }
     env.update({key: str(value) for key, value in overrides.items()})
     return env
@@ -102,6 +109,13 @@ async def _wait_for_port(port: int, process, timeout: float = 20.0) -> None:
     raise AssertionError(f"server did not listen on port {port} within {timeout}s")
 
 
+def image_size(data: bytes) -> tuple[int, int]:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as image:
+        return image.size
+
+
 def image_bytes(result) -> bytes:
     """Pull the single image out of a tool result."""
     images = [block for block in result.content if block.type == "image"]
@@ -119,7 +133,9 @@ class TestStdio:
                 tools = {tool.name: tool for tool in (await client.list_tools()).tools}
 
         assert set(tools) == {"grab_frame", "camera_status"}
-        assert "max_age_s" in tools["grab_frame"].input_schema["properties"]
+        properties = tools["grab_frame"].input_schema["properties"]
+        assert "max_age_s" in properties
+        assert "region" in properties
         assert tools["grab_frame"].input_schema.get("required", []) == []
 
     async def test_grab_frame_returns_a_fresh_image(self):
@@ -337,3 +353,86 @@ class TestBadConfiguration:
         assert process.returncode != 0
         assert expected in stderr.decode()
         assert "Traceback" not in stderr.decode()
+
+
+class TestRegionCrop:
+    """grab_frame's region argument, end to end over a real transport."""
+
+    async def test_returns_the_requested_fraction_of_the_frame(self):
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(fake.base_url) as client:
+                whole = await client.call_tool("grab_frame", {})
+                quarter = await client.call_tool(
+                    "grab_frame", {"region": [0.5, 0.0, 0.5, 0.5], "max_age_s": 5}
+                )
+
+        assert not quarter.is_error, quarter.content
+        full_w, full_h = image_size(image_bytes(whole))
+        crop_w, crop_h = image_size(image_bytes(quarter))
+        assert (crop_w, crop_h) == (full_w // 2, full_h // 2)
+
+    async def test_a_region_that_runs_off_the_frame_is_refused(self):
+        """Clamping silently would hand back a different region than was asked
+        for, and nothing downstream could tell."""
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(fake.base_url) as client:
+                result = await client.call_tool(
+                    "grab_frame", {"region": [0.8, 0.0, 0.5, 0.5], "max_age_s": 5}
+                )
+
+        assert result.is_error
+        assert "runs past the edge" in str(result.content)
+
+    async def test_the_wrong_number_of_coordinates_says_what_is_expected(self):
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(fake.base_url) as client:
+                result = await client.call_tool(
+                    "grab_frame", {"region": [0.5, 0.5], "max_age_s": 5}
+                )
+
+        assert result.is_error
+        assert "exactly 4 numbers" in str(result.content)
+
+
+class TestCameraControls:
+    """Whether the control tools are offered, which depends on the deployment.
+
+    Not that they work -- that needs a real V4L2 device and is covered against a
+    fake driver in test_controls.py. What matters here is that a server with no
+    camera node does not advertise tools whose every call would fail, and that
+    an operator who says the node exists gets them.
+    """
+
+    async def test_absent_when_there_is_no_device_node(self):
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(
+                fake.base_url, CAMERA_CONTROLS="auto", CAMERA_DEVICE="/dev/does-not-exist"
+            ) as client:
+                tools = {tool.name for tool in (await client.list_tools()).tools}
+
+        assert tools == {"grab_frame", "camera_status"}
+
+    async def test_offered_when_enabled_explicitly(self):
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(fake.base_url, CAMERA_CONTROLS="true") as client:
+                tools = {tool.name for tool in (await client.list_tools()).tools}
+
+        assert {
+            "camera_controls",
+            "camera_zoom",
+            "camera_focus",
+            "camera_exposure",
+            "camera_white_balance",
+            "camera_set",
+            "camera_reset",
+        } <= tools
+
+    async def test_status_reports_the_capture_size(self):
+        """So a caller can tell whether detail is missing because the frame is
+        small or because the camera is pointed wrong."""
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(fake.base_url) as client:
+                await client.call_tool("grab_frame", {})
+                result = await client.call_tool("camera_status", {})
+
+        assert json.loads(result.content[0].text)["frame_size"] == "640x480"

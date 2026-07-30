@@ -82,6 +82,10 @@ def entrypoint_env(bin_dir: Path, port: int, **overrides) -> dict[str, str]:
         "MCP_MODE": "stdio",
         "MCP_GRAB_TIMEOUT_S": "10",
         "MCP_LOG_LEVEL": "WARNING",
+        # As in test_transports: the entrypoint's job is to get cam2ip up and
+        # hand over to the server, and that should be asserted the same way on a
+        # machine with a camera and one without.
+        "CAMERA_CONTROLS": "false",
     }
     env.update({key: str(value) for key, value in overrides.items()})
     return env

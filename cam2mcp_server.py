@@ -37,6 +37,21 @@ things do that, and each covers a case the others cannot:
    died, which would otherwise leave a frame from an earlier connection sitting
    in memory looking usable.
 
+Camera controls
+---------------
+cam2ip owns the stream and exposes no way to change zoom, focus or exposure, so
+this server drives them itself: it opens the same V4L2 node beside cam2ip and
+writes controls directly, which is allowed because controls are not part of the
+exclusive streaming interface. See v4l2_controls.py for why that is safe and
+what it costs.
+
+The cost worth restating here is that control state lives in the camera's
+firmware, not in this process. Left alone it outlives the container and lands on
+whoever opens the camera next. So anything this server changes is remembered and
+put back once the camera has been idle for MCP_CONTROL_IDLE_S -- the same
+"nobody is asking any more" signal that drops the MJPEG subscription, applied to
+a second kind of state.
+
 Configuration (all optional):
 
   CAM2IP_BASE_URL        cam2ip base URL              (http://127.0.0.1:56000)
@@ -51,11 +66,18 @@ Configuration (all optional):
   MCP_STREAM_IDLE_S      keep stream warm this long   (30.0)
   MCP_ALLOWED_HOSTS      comma-separated Host allowlist (unset = allow any)
   MCP_ALLOWED_ORIGINS    comma-separated Origin allowlist (unset = allow any)
+  CAMERA_DEVICE          V4L2 node for controls       (/dev/video0)
+  CAMERA_CONTROLS        enable the control tools     (auto)
+  MCP_CONTROL_IDLE_S     put changed controls back after this long idle (120.0;
+                         0 disables, leaving changes until camera_reset)
+  AUDIO_CAPTURE          offer record_audio: true | auto | false (false)
+  AUDIO_DEVICE           ALSA device or card-name substring (first USB card)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -66,8 +88,21 @@ from typing import AsyncIterator
 
 import httpx2
 from mcp.server import MCPServer
-from mcp.server.mcpserver import Image
+from mcp.server.mcpserver import Audio, Image
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ContentBlock, TextContent
+
+import audio_capture
+import v4l2_controls
+from v4l2_controls import CameraControlError, CameraControls
+
+# Pillow backs the region crop and nothing else. Imported softly because it is
+# the one dependency that is not needed to serve a whole frame: a missing Pillow
+# should cost the crop argument, not the server.
+try:
+    from PIL import Image as PILImage
+except ImportError:  # pragma: no cover - exercised by the packaging, not the tests
+    PILImage = None
 
 log = logging.getLogger("cam2mcp")
 
@@ -80,6 +115,12 @@ FALLBACK_BOUNDARY = b"--boundary"
 MAX_PART_BYTES = 32 * 1024 * 1024
 
 RECONNECT_BACKOFF_S = (0.1, 0.25, 0.5, 1.0, 2.0)
+
+# JPEG quality for a cropped region. Above cam2ip's own 75 because this is the
+# second lossy pass over the same pixels, applied to exactly the part someone is
+# trying to read detail out of; the region is a fraction of the frame, so the
+# result is still smaller than the whole frame at 75.
+CROP_QUALITY = 90
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +168,15 @@ class Config:
     stream_idle_s: float
     allowed_hosts: list[str] | None
     allowed_origins: list[str] | None
+    # Defaulted, unlike the fields above, so that constructing a Config for the
+    # frame path alone does not have to say anything about controls -- which is
+    # also what keeps adding a control setting from touching every test that
+    # builds one.
+    camera_device: str = "/dev/video0"
+    controls_enabled: str = "auto"
+    control_idle_s: float = 120.0
+    audio_enabled: str = "false"
+    audio_device: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -149,6 +199,25 @@ class Config:
             stream_idle_s=_env_number("MCP_STREAM_IDLE_S", 30.0, float, 0.0),
             allowed_hosts=_env_list("MCP_ALLOWED_HOSTS"),
             allowed_origins=_env_list("MCP_ALLOWED_ORIGINS"),
+            camera_device=_env_str("CAMERA_DEVICE", "/dev/video0"),
+            # "auto" rather than a boolean default: the control tools need a
+            # device node passed into the container, which the frame path does
+            # not (it reaches the camera through cam2ip over HTTP, and cam2ip may
+            # not even be local). Registering tools that are guaranteed to fail
+            # in that setup is worse than not offering them, so absence of the
+            # node disables them quietly -- while an explicit "true" turns that
+            # into a startup error, for someone who meant to have them.
+            controls_enabled=_env_str("CAMERA_CONTROLS", "auto").strip().lower(),
+            control_idle_s=_env_number("MCP_CONTROL_IDLE_S", 120.0, float, 0.0),
+            # Off unless asked for, and deliberately not "auto" like the camera
+            # controls. The difference is what the capability is: a webcam's
+            # indicator light announces that it is being watched, and a caller
+            # asking this server for a picture already knows a camera is
+            # involved. A microphone advertises nothing, and "the sound card
+            # happened to be visible in the container" is not consent to record
+            # the room. An operator turns this on.
+            audio_enabled=_env_str("AUDIO_CAPTURE", "false").strip().lower(),
+            audio_device=_env_str("AUDIO_DEVICE", "").strip(),
         )
 
 
@@ -396,6 +465,16 @@ class FrameSource:
         if self._frame is None or now - self._frame_at > self._config.http_timeout_s:
             return "connected_but_no_frames"
         return "streaming"
+
+    def last_frame_data(self) -> bytes | None:
+        """The most recent frame, without waiting for or provoking a new one.
+
+        For describing the stream rather than using it -- reading the capture
+        size out of a frame that is already in hand. Deliberately not a grab: a
+        status call must not wake the camera up, or asking how things are going
+        would itself turn the indicator light on.
+        """
+        return self._frame
 
     def status(self) -> dict[str, object]:
         now = time.monotonic()
@@ -653,11 +732,261 @@ class FrameSource:
 
 
 # ---------------------------------------------------------------------------
+# Cropping
+# ---------------------------------------------------------------------------
+
+
+def frame_size(data: bytes) -> tuple[int, int] | None:
+    """Pixel dimensions of a JPEG, or None if they cannot be read.
+
+    Pillow parses the header lazily -- opening does not decode the scan -- so
+    this is cheap enough to run on every status call.
+    """
+    if PILImage is None:
+        return None
+    try:
+        import io
+
+        with PILImage.open(io.BytesIO(data)) as image:
+            return image.size
+    except Exception:  # noqa: BLE001 - a frame we cannot parse is not fatal here
+        return None
+
+
+def crop_jpeg(data: bytes, region: tuple[float, float, float, float], quality: int) -> bytes:
+    """Return the given fraction of a JPEG, re-encoded.
+
+    The region is fractions of the frame rather than pixels, and that is a
+    deliberate interface choice rather than a convenience. A caller picking a
+    region is a model that has just looked at the picture and wants "the top
+    right quarter"; it knows where things are in the frame proportionally, but it
+    does not know the frame is 1920 wide unless something tells it. Fractions
+    also survive the capture resolution being changed underneath it, which pixel
+    coordinates silently would not.
+    """
+    if PILImage is None:
+        raise RuntimeError(
+            "cropping needs Pillow, which is not installed in this image; "
+            "call grab_frame without region to get the whole frame"
+        )
+
+    import io
+
+    left, top, width, height = region
+    for name, value in zip(("x", "y", "width", "height"), region):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"region {name}={value} must be between 0 and 1")
+    if width <= 0 or height <= 0:
+        raise ValueError("region width and height must be greater than 0")
+    if left + width > 1.0 or top + height > 1.0:
+        raise ValueError(
+            f"region [{left}, {top}, {width}, {height}] runs past the edge of the "
+            f"frame: x+width and y+height must each be at most 1"
+        )
+
+    with PILImage.open(io.BytesIO(data)) as image:
+        source_w, source_h = image.size
+        box = (
+            int(left * source_w),
+            int(top * source_h),
+            max(int((left + width) * source_w), int(left * source_w) + 1),
+            max(int((top + height) * source_h), int(top * source_h) + 1),
+        )
+        cropped = image.crop(box)
+        if cropped.mode not in ("RGB", "L"):
+            cropped = cropped.convert("RGB")
+        out = io.BytesIO()
+        # Higher quality than cam2ip's own re-encode, because this is the second
+        # lossy pass over the same pixels and it is applied to the region someone
+        # is trying to read detail out of. Cheap: the region is a fraction of the
+        # frame, so the file is smaller than the original even at 90.
+        cropped.save(out, format="JPEG", quality=quality, optimize=True)
+        return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Camera controls
+# ---------------------------------------------------------------------------
+
+
+class ControlSession:
+    """Camera controls plus the promise to put them back.
+
+    The restore is on a timer rather than tied to a request, because there is no
+    request that means "done adjusting". An agent zooms in, grabs a frame, thinks,
+    grabs another; any per-call restore would undo the zoom before the second
+    grab. What genuinely marks the end is the same thing that ends the stream --
+    nobody asking for anything for a while -- so that is what this waits for.
+
+    Every camera interaction refreshes the timer, control writes and frame grabs
+    alike, since a caller still taking pictures is still using the settings it
+    chose even if it is not changing them.
+    """
+
+    def __init__(self, controls: CameraControls, idle_s: float) -> None:
+        self._controls = controls
+        self._idle_s = idle_s
+        self._lock = asyncio.Lock()
+        self._last_touch = time.monotonic()
+        self._task: asyncio.Task[None] | None = None
+        self._closed = False
+        self._last_restore: str | None = None
+
+    @property
+    def device(self) -> str:
+        return self._controls.device
+
+    def touch(self) -> None:
+        """Note camera activity, so the restore timer starts over."""
+        self._last_touch = time.monotonic()
+
+    async def _run(self, fn, *args, **kwargs):
+        """Run a blocking ioctl off the event loop.
+
+        Control ioctls normally return in microseconds, so this looks like
+        overkill -- but they go to a USB device that can be unplugged mid-call,
+        and a control write that blocks on a wedged device would otherwise stall
+        every frame the server is serving at the time.
+        """
+        async with self._lock:
+            self.touch()
+            result = await asyncio.to_thread(fn, *args, **kwargs)
+            self._ensure_watchdog()
+            return result
+
+    def _ensure_watchdog(self) -> None:
+        if (
+            self._idle_s > 0
+            and not self._closed
+            and self._controls.dirty
+            and (self._task is None or self._task.done())
+        ):
+            self._task = asyncio.create_task(self._watch(), name="camera-control-restore")
+
+    async def _watch(self) -> None:
+        """Wait out the idle period, then put the controls back.
+
+        Re-checks rather than sleeping once for idle_s: every touch pushes the
+        deadline out, so the wait has to be recomputed against the latest one.
+        """
+        try:
+            while not self._closed and self._controls.dirty:
+                remaining = self._idle_s - (time.monotonic() - self._last_touch)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                async with self._lock:
+                    # Checked again under the lock: a control write could have
+                    # landed between the deadline passing and the lock being
+                    # taken, and restoring out from under it would undo a change
+                    # the caller has not seen the result of yet.
+                    if time.monotonic() - self._last_touch < self._idle_s:
+                        continue
+                    await self._restore_locked("idle")
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced through status
+            log.warning("automatic control restore failed: %s", exc)
+
+    async def _restore_locked(self, why: str) -> dict[str, int]:
+        try:
+            restored = await asyncio.to_thread(self._controls.restore)
+        except CameraControlError as exc:
+            self._last_restore = f"{why}: {exc}"
+            log.warning("control restore (%s) incomplete: %s", why, exc)
+            raise
+        if restored:
+            log.info("restored camera controls (%s): %s", why, ", ".join(restored))
+            self._last_restore = f"{why}: " + ", ".join(f"{k}={v}" for k, v in restored.items())
+        return restored
+
+    # -- operations --------------------------------------------------------
+
+    async def list_all(self) -> list[dict[str, object]]:
+        return await self._run(self._controls.get_all)
+
+    async def get(self, name: str) -> int:
+        return await self._run(self._controls.get, name)
+
+    async def set_many(self, settings: dict[str, int]) -> dict[str, int]:
+        """Apply several controls in one call, reporting what the driver stored.
+
+        Applied in the order given so a caller can express a dependency between
+        two of them, and not rolled back on a later failure: the ones that landed
+        are real changes to the camera and pretending otherwise would be a lie
+        about the state the caller is now in. The error names which succeeded.
+        """
+        applied: dict[str, int] = {}
+        async with self._lock:
+            self.touch()
+            try:
+                for name, value in settings.items():
+                    applied[name] = await asyncio.to_thread(self._controls.set, name, value)
+            except CameraControlError as exc:
+                if applied:
+                    raise CameraControlError(
+                        f"{exc}. Already applied: "
+                        + ", ".join(f"{k}={v}" for k, v in applied.items())
+                    ) from None
+                raise
+            finally:
+                self._ensure_watchdog()
+        return applied
+
+    async def restore(self) -> dict[str, int]:
+        async with self._lock:
+            self.touch()
+            return await self._restore_locked("requested")
+
+    async def reset_to_defaults(self) -> dict[str, int]:
+        async with self._lock:
+            self.touch()
+            result = await asyncio.to_thread(self._controls.reset_to_defaults)
+            self._last_restore = "reset to driver defaults"
+            return result
+
+    def status(self) -> dict[str, object]:
+        changed = self._controls.changed()
+        return {
+            "device": self._controls.device,
+            "changed_by_this_server": changed or None,
+            "restore_after_idle_s": self._idle_s or None,
+            "seconds_idle": round(time.monotonic() - self._last_touch, 1),
+            "last_restore": self._last_restore,
+        }
+
+    async def aclose(self) -> None:
+        """Put the controls back on the way out.
+
+        Shutdown is the one moment where leaving the camera changed is certain to
+        strand it: there will be no later idle tick to catch it, because there is
+        no later anything. Best-effort -- a container being killed does not always
+        leave time for a USB round trip -- which is why the idle restore exists
+        rather than relying on this.
+        """
+        self._closed = True
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - shutdown
+                pass
+        if self._controls.dirty:
+            try:
+                await self._restore_locked("shutdown")
+            except Exception as exc:  # noqa: BLE001 - shutdown
+                log.warning("could not restore controls on shutdown: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
 
 CONFIG = Config.from_env()
 _source: FrameSource | None = None
+_controls: ControlSession | None = None
 
 
 def source() -> FrameSource:
@@ -667,11 +996,38 @@ def source() -> FrameSource:
     return _source
 
 
+def controls_available() -> bool:
+    """Whether the control tools should exist at all in this deployment.
+
+    Resolved once at import, because MCP advertises its tool list at startup and
+    a tool that appears and disappears would be worse than one that is absent:
+    a client caches the list it was given.
+    """
+    if CONFIG.controls_enabled in ("false", "0", "no", "off"):
+        return False
+    if CONFIG.controls_enabled in ("true", "1", "yes", "on"):
+        return True
+    return os.path.exists(CONFIG.camera_device)
+
+
+def controls() -> ControlSession:
+    global _controls
+    if _controls is None:
+        _controls = ControlSession(
+            CameraControls(CONFIG.camera_device), CONFIG.control_idle_s
+        )
+    return _controls
+
+
 @asynccontextmanager
 async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Controls first: this is the state that outlives the process, so it is
+        # the one worth spending the shutdown window on.
+        if _controls is not None:
+            await _controls.aclose()
         if _source is not None:
             await _source.aclose()
 
@@ -687,12 +1043,22 @@ mcp = MCPServer(
 
 
 @mcp.tool()
-async def grab_frame(max_age_s: float | None = None) -> Image:
+async def grab_frame(
+    max_age_s: float | None = None,
+    region: list[float] | None = None,
+) -> Image:
     """Capture a frame from the attached webcam and return it as a JPEG image.
 
     The image shows what the camera sees now, not a leftover from an earlier
     call. Waking a cold camera takes a moment, so the first call after a quiet
     spell is slower than the ones after it.
+
+    To see something in more detail there are two options, and region is usually
+    the better one. It crops the frame that was already captured, so it costs
+    nothing but a re-encode and changes no camera state -- meaning it cannot
+    disturb anything else using the camera, and there is nothing to undo. Use
+    camera_zoom instead when the detail is not resolved in the full frame at all,
+    since that crops inside the camera before the sensor image is scaled down.
 
     On what max_age_s does and does not promise: it bounds how long ago a frame
     *arrived here*, not when the sensor captured it, because nothing in the
@@ -710,13 +1076,37 @@ async def grab_frame(max_age_s: float | None = None) -> Image:
             Zero is not "as fresh as possible" but something stricter: it demands
             a frame that arrives *after* this call begins, so one captured
             microseconds earlier is refused and the call waits for the next.
+        region: Crop to [x, y, width, height], as fractions of the frame between
+            0 and 1, with x=0, y=0 at the top left. The whole frame is
+            [0, 0, 1, 1]; the top right quarter is [0.5, 0, 0.5, 0.5]. Fractions
+            rather than pixels, so a region can be chosen from having looked at
+            the picture, without knowing what resolution it was captured at.
     """
     if max_age_s is not None and max_age_s < 0:
         raise ValueError("max_age_s must be >= 0")
+    if region is not None and len(region) != 4:
+        raise ValueError(
+            f"region takes exactly 4 numbers -- [x, y, width, height] as "
+            f"fractions of the frame -- got {len(region)}"
+        )
 
     frame = await source().grab(max_age_s)
+    # A frame grab is camera activity, so it defers the automatic restore of any
+    # controls the caller set: still taking pictures means still using them.
+    if _controls is not None:
+        _controls.touch()
+
+    data = frame.data
     subtype = frame.content_type.partition("/")[2] or "jpeg"
-    return Image(data=frame.data, format=subtype)
+    if region is not None:
+        # Off the event loop: decoding and re-encoding a 4K frame is tens of
+        # milliseconds of pure CPU, which is long enough to stutter the MJPEG
+        # pump keeping frames fresh for everyone else.
+        data = await asyncio.to_thread(
+            crop_jpeg, data, (region[0], region[1], region[2], region[3]), CROP_QUALITY
+        )
+        subtype = "jpeg"
+    return Image(data=data, format=subtype)
 
 
 @mcp.tool()
@@ -724,9 +1114,286 @@ async def camera_status() -> dict[str, object]:
     """Report how the camera stream is doing: connection state, frame counts and errors.
 
     Useful for diagnosing a camera that returns errors or frames that look
-    older than expected.
+    older than expected. Also reports the captured frame size, and which camera
+    controls this server has changed and not yet put back.
     """
-    return source().status()
+    status = source().status()
+
+    frame = source().last_frame_data()
+    size = frame_size(frame) if frame is not None else None
+    status["frame_size"] = f"{size[0]}x{size[1]}" if size else None
+
+    if controls_available():
+        status["controls"] = controls().status()
+    return status
+
+
+# ---------------------------------------------------------------------------
+# Camera control tools
+# ---------------------------------------------------------------------------
+#
+# Registered only where there is a device node to drive (see controls_available),
+# because a tool whose every call fails is worse than one that was never offered.
+# Everything these do is also reachable through camera_set; they exist as
+# separate tools because naming the common adjustments makes them findable
+# without first enumerating the control list.
+
+if controls_available():
+
+    @mcp.tool()
+    async def camera_controls() -> dict[str, object]:
+        """List every camera setting, with its range, current value and default.
+
+        Start here when an image needs fixing rather than reframing -- too dark,
+        out of focus, wrong colour -- since it shows what this particular camera
+        supports rather than what cameras generally do. Settings marked inactive
+        are being overridden by an automatic mode; setting one directly turns
+        that mode off for you.
+
+        Anything listed can be written with camera_set, including the settings
+        that have no dedicated tool: brightness, contrast, saturation, gamma,
+        sharpness, backlight_compensation and power_line_frequency.
+        """
+        session = controls()
+        return {
+            "device": session.device,
+            "controls": await session.list_all(),
+            "changed_by_this_server": session.status()["changed_by_this_server"],
+            "note": (
+                "Changes persist in the camera itself, not in this server, so "
+                "they outlive this conversation and affect anything else using "
+                "the camera. They are put back automatically once the camera has "
+                "been idle, or immediately by camera_reset."
+            ),
+        }
+
+    @mcp.tool()
+    async def camera_zoom(level: int) -> dict[str, object]:
+        """Set the camera's digital zoom.
+
+        This crops inside the camera, ahead of the scaling that produces the
+        streamed frame, so it recovers real detail that the full frame does not
+        resolve. That is its advantage over grab_frame's region argument, and the
+        reason to prefer region anyway when the detail *is* already in the frame:
+        zoom narrows the field of view for everything else using the camera and
+        has to be undone, while a region crop does neither.
+
+        There is no pan or tilt on this class of camera, so a zoomed view is
+        centred and cannot be aimed. To look at something off-centre, stay zoomed
+        out and crop with grab_frame's region instead.
+
+        Args:
+            level: 0 for the full field of view, up to the maximum reported by
+                camera_controls as zoom_absolute (100 on the EMEET S600).
+        """
+        applied = await controls().set_many({"zoom_absolute": level})
+        return {"zoom_absolute": applied["zoom_absolute"]}
+
+    @mcp.tool()
+    async def camera_focus(
+        position: int | None = None, auto: bool | None = None
+    ) -> dict[str, object]:
+        """Focus the camera, automatically or at a fixed distance.
+
+        Worth reaching for when continuous autofocus will not settle: it hunts on
+        close subjects, on low-contrast surfaces, and on anything held up to the
+        lens, which is most of the cases where a close look is wanted in the
+        first place. Fixing the focus manually also stops it drifting between
+        frames while something is being examined.
+
+        The position is a raw driver value, not a distance, and the mapping is
+        not linear or documented; find the right one by trying a value, grabbing
+        a frame and adjusting. Higher values are nearer on this camera.
+
+        Args:
+            position: Focus point, 0 to the maximum reported as focus_absolute
+                (1023 on the EMEET S600). Setting it turns autofocus off.
+            auto: True to hand focus back to continuous autofocus, False to hold
+                the current point. Ignored if position is given.
+        """
+        settings: dict[str, int] = {}
+        if position is not None:
+            settings["focus_absolute"] = position
+        elif auto is not None:
+            settings["focus_automatic_continuous"] = 1 if auto else 0
+        else:
+            raise ValueError("camera_focus needs either position or auto")
+
+        applied = await controls().set_many(settings)
+        return {
+            **applied,
+            "focus_automatic_continuous": await controls().get(
+                "focus_automatic_continuous"
+            ),
+        }
+
+    @mcp.tool()
+    async def camera_exposure(
+        time_absolute: int | None = None,
+        gain: int | None = None,
+        auto: bool | None = None,
+    ) -> dict[str, object]:
+        """Set exposure time and gain, or hand them back to automatic.
+
+        Three situations need this. A screen or anything else lit by a flickering
+        source bands unless the exposure time is matched to the mains frequency
+        (see also power_line_frequency via camera_set). A moving subject blurs
+        unless the time is shortened. And a dark scene stays dark if the
+        automatic mode is metering for a bright window instead -- though
+        backlight_compensation via camera_set is often the better fix there.
+
+        Raising gain brightens without lengthening the exposure, at the cost of
+        noise. Prefer a longer exposure when the subject is still.
+
+        Args:
+            time_absolute: Exposure time in units of 100us, so 100 is 10ms. The
+                range this camera accepts is reported as exposure_time_absolute
+                (1 to 5000). Setting it switches exposure to manual.
+            gain: Sensor gain, 0 to the reported maximum (100 here).
+            auto: True to return to automatic exposure, False to hold the current
+                settings. Applied after the other two if combined with them.
+        """
+        settings: dict[str, int] = {}
+        if time_absolute is not None:
+            settings["exposure_time_absolute"] = time_absolute
+        if gain is not None:
+            settings["gain"] = gain
+        # Last, so that combining auto=True with an explicit time is not
+        # self-defeating: setting the time switches to manual, and re-enabling
+        # automatic afterwards is the order that matches what was asked for.
+        if auto is not None:
+            settings["auto_exposure"] = (
+                v4l2_controls.EXPOSURE_AUTO if auto else v4l2_controls.EXPOSURE_MANUAL
+            )
+        if not settings:
+            raise ValueError("camera_exposure needs time_absolute, gain or auto")
+
+        return await controls().set_many(settings)
+
+    @mcp.tool()
+    async def camera_white_balance(
+        temperature: int | None = None, auto: bool | None = None
+    ) -> dict[str, object]:
+        """Fix the white balance at a colour temperature, or return it to automatic.
+
+        Automatic white balance is a guess about what in the scene is neutral,
+        and it shifts as the scene changes. Pin it when colour is the thing being
+        judged -- wire colours, resistor bands, indicator LEDs, anything where
+        the answer changes if the camera decides the lighting is warmer than it
+        thought a frame ago.
+
+        Rough guide: 2700-3000K incandescent, 4000K fluorescent, 5000-5500K
+        daylight, 6500K overcast. Lower values make the image warmer.
+
+        Args:
+            temperature: Colour temperature in kelvin, within the range reported
+                as white_balance_temperature (2300-6500 here). Setting it turns
+                automatic white balance off.
+            auto: True to return to automatic, False to hold the current value.
+                Ignored if temperature is given.
+        """
+        settings: dict[str, int] = {}
+        if temperature is not None:
+            settings["white_balance_temperature"] = temperature
+        elif auto is not None:
+            settings["white_balance_automatic"] = 1 if auto else 0
+        else:
+            raise ValueError("camera_white_balance needs either temperature or auto")
+
+        return await controls().set_many(settings)
+
+    @mcp.tool()
+    async def camera_set(settings: dict[str, int]) -> dict[str, object]:
+        """Set any camera controls by name, for the ones without a dedicated tool.
+
+        Names and valid values come from camera_controls; brightness, contrast,
+        saturation, hue, gamma, sharpness, backlight_compensation and
+        power_line_frequency all live here. Values are applied in the order given
+        and each is read back, so the reply is what the camera actually stored
+        rather than what was asked for -- a driver may clamp or round silently.
+
+        Args:
+            settings: Control name to value, for example
+                {"sharpness": 96, "backlight_compensation": 1}.
+        """
+        if not settings:
+            raise ValueError("camera_set needs at least one setting")
+        return await controls().set_many(settings)
+
+    @mcp.tool()
+    async def camera_reset(to_defaults: bool = False) -> dict[str, object]:
+        """Undo camera setting changes.
+
+        Worth calling explicitly when finished, even though an idle camera is
+        restored automatically: the settings live in the camera's firmware, so
+        until then they apply to every other thing that opens it.
+
+        Args:
+            to_defaults: False (the default) puts back only what this server
+                changed, leaving anything set by another application alone. True
+                sets every control to the driver's default instead, which is the
+                way to clear state this server did not create -- an earlier
+                session that exited without restoring, or another application's
+                leftovers.
+        """
+        session = controls()
+        if to_defaults:
+            return {"reset": "driver defaults", "controls": await session.reset_to_defaults()}
+        restored = await session.restore()
+        return {
+            "reset": "values this server changed",
+            "controls": restored or "nothing had been changed",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Microphone
+# ---------------------------------------------------------------------------
+
+
+def audio_available() -> bool:
+    """Whether to offer recording. Requires being switched on, not just possible."""
+    if CONFIG.audio_enabled not in ("true", "1", "yes", "on", "auto"):
+        return False
+    if CONFIG.audio_enabled == "auto":
+        return audio_capture.available(CONFIG.audio_device or None)
+    return True
+
+
+if audio_available():
+
+    @mcp.tool()
+    async def record_audio(seconds: float = 3.0) -> list[ContentBlock]:
+        """Record a short clip from the webcam's microphone and report its level.
+
+        The microphone is a separate device from the camera sharing the same
+        cable, so recording neither needs nor disturbs the video stream, and
+        nothing lights up while it happens.
+
+        The reply is the audio itself plus a measured level, because most
+        questions here are answered by the level alone: whether a machine is
+        still running, whether a room is occupied, whether the microphone is
+        connected at all. A dead channel and a quiet room are indistinguishable
+        by ear on a short clip and obvious in the numbers.
+
+        Args:
+            seconds: How long to record, up to 60. Longer clips are rarely more
+                informative for a level reading; 2-5s is enough to tell a running
+                machine from a stopped one.
+        """
+        device = audio_capture.find_device(CONFIG.audio_device or None)
+        wav = await audio_capture.record(device, seconds)
+        # Off the event loop: the sum-of-squares over a long clip is real CPU,
+        # and the MJPEG pump is running underneath.
+        levels = await asyncio.to_thread(audio_capture.analyse, wav)
+        # Built as content blocks rather than returned as a (str, Audio) pair:
+        # the tool-result serializer handles a single Image or Audio helper, and
+        # a list of ContentBlocks, but not a list with a helper inside it -- that
+        # fails at call time with "unable to serialize unknown type".
+        return [
+            TextContent(type="text", text=json.dumps({"device": device, **levels}, indent=2)),
+            Audio(data=wav, format="wav").to_audio_content(),
+        ]
 
 
 # ---------------------------------------------------------------------------
