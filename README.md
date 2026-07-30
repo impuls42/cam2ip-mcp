@@ -153,26 +153,27 @@ you nothing there.
 
 ### Reproducing the stale queue, if you want to see it
 
-The queue only holds stale frames while the device stays open, which
-`CAM2IP_LAZY` decides — and the default makes it *harder* to observe, not easier:
+The queue only holds stale frames while something keeps the device open *and*
+stops draining it. `CAM2IP_LAZY` decides the first half, and the default makes
+this harder to observe, not easier:
 
-- **`CAM2IP_LAZY=false`** keeps the device open indefinitely, so the queue holds
-  four frames from whenever it last drained, however long ago that was. This is
-  the setting under which a snapshot was measured returning a scene 68 seconds
-  old.
-- **`CAM2IP_LAZY=true`** (the default) closes the device about 30 seconds after
-  the last read. Closing frees the buffers, so a reopen captures fresh ones. The
-  queue can still be stale within that window — a snapshot taken 10 seconds after
-  the last one can be 10 seconds old — but wait longer than the hold and the
-  evidence has been cleaned up before you look.
+- **`CAM2IP_LAZY=false`** holds the device open whether or not anything is
+  subscribed, so the queue keeps four frames from whenever it last drained,
+  however long ago. This is the setting under which a snapshot was measured
+  returning a scene 68 seconds old.
+- **`CAM2IP_LAZY=true`** (the default) releases the device once nothing is
+  subscribed, which frees the buffers, so the next request reopens and captures
+  fresh ones. Measured at 10s, 20s and 60s+ after a stream dropped, `/jpeg`
+  returned the current scene every time — on the default settings a snapshot
+  after an idle could not be made stale by any idle length tried.
 
-So a reproduction that idles for a minute and then reads `/jpeg` will see nothing
-on the default settings: it is measuring the reopen path. Either set
-`CAM2IP_LAZY=false`, or probe inside the hold window.
+So reproducing it through cam2ip needs `CAM2IP_LAZY=false`. Idling against the
+defaults measures the reopen path instead.
 
-None of this changes what the server has to defend against. The warm-up drop is
-sized against the queue depth, which is bounded at four regardless of how long
-the stall ran or which of these two cases produced it.
+Below cam2ip the behaviour is unconditional, and that is what the fix is sized
+against. Reading the driver directly — `VIDIOC_REQBUFS(4)`, stream on, stall,
+then drain — returns exactly four stale frames and then a current one, for every
+stall from 0.5s to 30s. Only their age grows; the depth never does.
 
 ## Configuration
 
