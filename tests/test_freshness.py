@@ -309,10 +309,28 @@ class TestIdleWhileFailing:
             "pump kept reconnecting with nobody waiting for a frame"
         )
 
-    async def test_keeps_reconnecting_while_a_grab_is_waiting(self, source_factory):
-        """Idle means nobody waiting -- an in-flight grab must hold it open."""
+    @pytest.mark.parametrize(
+        "grab_timeout_s,stream_idle_s",
+        [
+            (1.5, 0.0),  # zero idle timeout
+            (4.0, 0.3),  # grab timeout well above the idle timeout
+        ],
+    )
+    async def test_keeps_reconnecting_while_a_grab_is_waiting(
+        self, source_factory, grab_timeout_s, stream_idle_s
+    ):
+        """Idle means nobody waiting -- an in-flight grab must hold it open.
+
+        Both orderings are covered on purpose. It would be easy to assume the
+        default grab_timeout_s (15s) being under stream_idle_s (30s) is what
+        stops a waiter being starved, and to then "document" that as a
+        constraint. It is not: the _waiters guard is, so inverting the two is
+        safe and stays safe.
+        """
         source = source_factory(
-            "http://127.0.0.1:1", grab_timeout_s=1.5, stream_idle_s=0.0
+            "http://127.0.0.1:1",
+            grab_timeout_s=grab_timeout_s,
+            stream_idle_s=stream_idle_s,
         )
 
         async def watch_while_waiting() -> list[bool]:
@@ -327,7 +345,9 @@ class TestIdleWhileFailing:
         with pytest.raises(FrameUnavailable):
             await grab
 
-        assert any(running), "pump gave up while a grab was still waiting"
+        # Alive at every sample, not merely at one of them: the guarantee is that
+        # it never gives up under a waiter, not that it lingers a while first.
+        assert all(running), f"pump gave up while a grab was still waiting: {running}"
 
     async def test_recovers_after_the_stream_drops(self, fake_cam, source_factory):
         """A dropped connection must reconnect, not wedge."""

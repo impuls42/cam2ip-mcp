@@ -57,7 +57,7 @@ import logging
 import os
 import sys
 import time
-from contextlib import aclosing, asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
 
@@ -412,9 +412,11 @@ class FrameSource:
                 self._task = None
             # Then wake grabbers so they re-check and restart promptly. Only an
             # optimisation: their wait is bounded by grab_timeout_s regardless.
-            with suppress(Exception):
-                async with self._cond:
-                    self._cond.notify_all()
+            # Not guarded: a CancelledError here belongs to a task that is ending
+            # anyway and is caught by aclose(), while anything else -- a misused
+            # Condition, say -- is a bug worth seeing rather than swallowing.
+            async with self._cond:
+                self._cond.notify_all()
 
     async def _stream_once(self) -> bool:
         """Consume one MJPEG connection. Returns True if it ended because we went idle."""
@@ -479,6 +481,18 @@ class FrameSource:
             self._cond.notify_all()
 
     async def _should_go_idle(self) -> bool:
+        """Whether to drop the subscription: nobody waiting, nobody asking lately.
+
+        A waiting grabber can never be starved by this, and not because
+        grab_timeout_s happens to be shorter than stream_idle_s -- that ordering
+        is not load-bearing and callers may invert it. Two things hold instead:
+        _waiters is non-zero for as long as anyone is blocked, and the check runs
+        under the same condition the grabber holds, so it cannot slip into the
+        moment between a wakeup and the next wait. A grabber also refreshes
+        _last_grab_at every time it wakes, so even a zero idle timeout keeps the
+        pump alive underneath it. Covered by the inverted-ordering test in
+        tests/test_freshness.py.
+        """
         async with self._cond:
             if self._waiters > 0:
                 return False
@@ -552,14 +566,25 @@ async def grab_frame(max_age_s: float | None = None) -> Image:
     """Capture a frame from the attached webcam and return it as a JPEG image.
 
     The image shows what the camera sees now, not a leftover from an earlier
-    call: the capture pipeline is kept running, and a frame older than max_age_s
-    is never returned -- the call waits for a new one instead. Waking a cold
-    camera takes a moment, so the first call after a quiet spell is slower.
+    call. Waking a cold camera takes a moment, so the first call after a quiet
+    spell is slower than the ones after it.
+
+    On what max_age_s does and does not promise: it bounds how long ago a frame
+    *arrived here*, not when the sensor captured it, because nothing in the
+    stream carries a capture time. It is therefore not a staleness detector -- a
+    frame that sat in the camera's buffer queue for a minute and reached us a
+    moment ago is young by this measure. What excludes those is the server
+    dropping the first frames after it reconnects, and keeping the pipeline
+    draining so they stop accumulating. This bound catches a different failure:
+    a stalled or dead pipeline leaving an old frame in memory.
 
     Args:
         max_age_s: How old a frame may be, in seconds, before it is refused.
             Defaults to the server's MCP_FRAME_MAX_AGE_S setting (1.0s). Raise
             it to accept a slightly older frame in exchange for a faster reply.
+            Zero is not "as fresh as possible" but something stricter: it demands
+            a frame that arrives *after* this call begins, so one captured
+            microseconds earlier is refused and the call waits for the next.
     """
     if max_age_s is not None and max_age_s < 0:
         raise ValueError("max_age_s must be >= 0")
@@ -592,12 +617,34 @@ def transport_security() -> TransportSecuritySettings | None:
     Returning None leaves mcp's own defaults in place: an allowlist is applied
     automatically when bound to loopback, and omitted when bound to a public
     interface (where the Host header is not knowable up front).
+
+    Passing settings at all replaces those defaults, and mcp's middleware then
+    validates Host and Origin together or not at all -- there is no per-check
+    switch, and no allowlist entry that means "any host" ("*" matches only a
+    literal "*" Host header). So an empty host list is not "unrestricted", it is
+    "reject everything with 421", which is why only setting origins cannot be
+    honoured and is refused below instead.
     """
     if CONFIG.allowed_hosts is None and CONFIG.allowed_origins is None:
         return None
+
+    if CONFIG.allowed_hosts is None:
+        raise SystemExit(
+            "MCP_ALLOWED_ORIGINS needs MCP_ALLOWED_HOSTS set as well.\n"
+            "  mcp checks Host and Origin together, and its host allowlist cannot\n"
+            "  express \"any host\" -- so restricting origins alone would leave an\n"
+            "  empty host allowlist, and every request would be refused with 421.\n"
+            "  List the names clients reach this server by, e.g.\n"
+            "  MCP_ALLOWED_HOSTS=camera.example.com:*,127.0.0.1:*"
+        )
+
+    # Hosts without origins is honoured as-is: a request carrying no Origin
+    # header passes (which is every non-browser MCP client), and one carrying any
+    # Origin is refused. That is the stricter reading of "lock this down", and
+    # MCP_ALLOWED_ORIGINS is how to let specific browsers back in.
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=CONFIG.allowed_hosts or [],
+        allowed_hosts=CONFIG.allowed_hosts,
         allowed_origins=CONFIG.allowed_origins or [],
     )
 
@@ -620,6 +667,10 @@ def main() -> None:
         mcp.run(transport="stdio")
         return
 
+    # Resolved before announcing anything, so a rejected allowlist does not print
+    # "serving ..." on its way out.
+    security = transport_security()
+
     path = "/mcp" if CONFIG.mode == "streamable-http" else "/sse"
     log.info(
         "serving MCP over %s at http://%s:%d%s, camera via %s",
@@ -629,7 +680,7 @@ def main() -> None:
         transport=CONFIG.mode,
         host=CONFIG.http_host,
         port=CONFIG.http_port,
-        transport_security=transport_security(),
+        transport_security=security,
     )
 
 

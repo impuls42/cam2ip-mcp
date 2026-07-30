@@ -155,7 +155,16 @@ there has a matching variable.
 | `MCP_STREAM_IDLE_S` | `30.0` | Hold the camera stream open this long after the last request |
 | `MCP_LOG_LEVEL` | `INFO` | Log level; logs always go to stderr |
 | `MCP_ALLOWED_HOSTS` | — | Comma-separated `Host` allowlist for the HTTP transports |
-| `MCP_ALLOWED_ORIGINS` | — | Comma-separated `Origin` allowlist |
+| `MCP_ALLOWED_ORIGINS` | — | Comma-separated `Origin` allowlist; requires `MCP_ALLOWED_HOSTS` |
+
+Leaving both allowlists unset keeps mcp's defaults — a loopback allowlist when
+bound to `127.0.0.1`, no restriction when bound to a public interface. Setting
+either replaces those defaults, and mcp then validates `Host` and `Origin`
+together with no way to express "any host", so `MCP_ALLOWED_HOSTS` is required as
+soon as you restrict anything; setting only `MCP_ALLOWED_ORIGINS` is refused at
+startup rather than rejecting every request with a `421`. Hosts alone is the
+common case: clients sending no `Origin` header pass, and any request carrying
+one is refused, so add `MCP_ALLOWED_ORIGINS` to permit specific browsers.
 
 ### Transports
 

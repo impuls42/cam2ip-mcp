@@ -226,6 +226,94 @@ class TestSse:
         assert excinfo.value.response.status_code == 421
 
 
+class TestAllowlists:
+    """An allowlist that locks out the operator is worse than none at all.
+
+    mcp replaces its own defaults as soon as any settings are passed, and then
+    checks Host and Origin together, with no allowlist entry meaning "any host"
+    ("*" matches only a literal "*" Host header). So a half-specified allowlist
+    is not a loose one, it is a closed door.
+    """
+
+    async def test_a_matching_host_is_admitted(self):
+        """The permitting side, so the tests are not all about rejection."""
+        async with running_fake_cam2ip() as fake:
+            async with http_session(
+                fake.base_url, MCP_ALLOWED_HOSTS="127.0.0.1:*,localhost:*"
+            ) as client:
+                result = await client.call_tool("grab_frame", {})
+
+        assert not result.is_error, result.content
+        assert image_bytes(result).startswith(b"\xff\xd8")
+
+    @pytest.mark.parametrize("mode", ["streamable-http", "sse"])
+    async def test_a_non_matching_host_is_refused(self, mode):
+        """No session can be established at all.
+
+        The exception type is deliberately not pinned: SSE surfaces the 421 as an
+        httpx HTTPStatusError, while streamable-http's probe turns it into an
+        MCPError. What makes this specific to the allowlist rather than to any
+        old connection failure is the contrast with the matching-host test above,
+        which is identical apart from the allowlist value.
+        """
+        async with running_fake_cam2ip() as fake:
+            with pytest.raises(Exception):  # noqa: B017 - see docstring
+                async with http_session(
+                    fake.base_url, mode=mode, MCP_ALLOWED_HOSTS="example.invalid"
+                ) as client:
+                    await client.call_tool("grab_frame", {})
+
+    async def test_origins_without_hosts_is_refused_at_startup(self):
+        """Setting only origins used to start cleanly and 421 every request.
+
+        The host allowlist ends up empty, which rejects everything -- and it also
+        overrides the loopback allowlist mcp would otherwise have applied, so the
+        setting that was meant to loosen things silently sealed the server shut.
+        Now it fails at startup, naming the variable that is missing.
+        """
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            SERVER,
+            env=server_env(
+                "http://127.0.0.1:1",
+                MCP_MODE="streamable-http",
+                MCP_HTTP_HOST="127.0.0.1",
+                MCP_HTTP_PORT=free_port(),
+                MCP_ALLOWED_ORIGINS="https://app.example.com",
+            ),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        message = stderr.decode()
+
+        assert process.returncode != 0
+        assert "MCP_ALLOWED_HOSTS" in message
+        assert "Traceback" not in message
+
+    async def test_both_together_are_accepted(self):
+        async with running_fake_cam2ip() as fake:
+            async with http_session(
+                fake.base_url,
+                MCP_ALLOWED_HOSTS="127.0.0.1:*",
+                MCP_ALLOWED_ORIGINS="https://app.example.com",
+            ) as client:
+                result = await client.call_tool("grab_frame", {})
+
+        # No Origin header from this client, which mcp permits.
+        assert not result.is_error, result.content
+
+    async def test_stdio_ignores_the_allowlist(self):
+        """The variables are HTTP-only; a stdio server must not trip over them."""
+        async with running_fake_cam2ip() as fake:
+            async with stdio_session(
+                fake.base_url, MCP_ALLOWED_ORIGINS="https://app.example.com"
+            ) as client:
+                result = await client.call_tool("grab_frame", {})
+
+        assert not result.is_error, result.content
+
+
 class TestBadConfiguration:
     @pytest.mark.parametrize(
         "env,expected",
