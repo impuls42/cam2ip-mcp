@@ -217,12 +217,36 @@ async def running_fake_cam2ip(**kwargs) -> AsyncIterator[FakeCam2ip]:
                 pass
 
 
+def _exit_with_parent() -> None:
+    """Ask the kernel to signal us when whatever launched us dies.
+
+    entrypoint.sh execs the MCP server over itself and leaves cam2ip running as
+    a background child, so a test that terminates the server orphans this
+    process. A container tears it down with the PID namespace; a test run would
+    leave it holding a port until someone noticed. Linux-only, and a no-op
+    elsewhere -- the tests that need it are Linux-only too.
+    """
+    if sys.platform != "linux":
+        return
+
+    import ctypes
+    import signal
+
+    PR_SET_PDEATHSIG = 1
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+    except OSError:  # pragma: no cover - no libc to talk to
+        pass
+
+
 def main() -> None:
     """Stand in for the cam2ip binary, reading CAM2IP_* config like the real one.
 
     Lets the entrypoint tests exercise container startup without a webcam.
     """
     import os
+
+    _exit_with_parent()
 
     host, _, port = os.environ.get("CAM2IP_BIND_ADDR", "0.0.0.0:56000").rpartition(":")
 
