@@ -17,6 +17,8 @@ for as long as the client stays subscribed.
 from __future__ import annotations
 
 import asyncio
+import functools
+import io
 import json
 import struct
 import sys
@@ -39,14 +41,42 @@ JPEG_COM = b"\xff\xfe"
 JPEG_EOI = b"\xff\xd9"
 
 
-def make_frame(seq: int, captured_at: float) -> bytes:
-    """Build a JPEG-shaped blob carrying its own identity in a COM segment.
+FRAME_SIZE = (640, 480)
 
-    Structurally a valid JPEG stream (SOI, comment, EOI) with no image data,
-    which is all this needs to be: nothing in the path under test decodes it.
+
+@functools.lru_cache(maxsize=1)
+def _image_body() -> bytes:
+    """A real encoded JPEG, minus its leading SOI, built once and reused.
+
+    Real pixels rather than an empty shell because the crop path decodes what it
+    is given. A frame that is only JPEG-shaped would make grab_frame(region=...)
+    fail in the tests for a reason no real camera would ever produce -- and it is
+    the same two bytes of difference either way, since every frame shares this
+    body and differs only in the comment spliced in front of it.
+
+    Not a flat colour: a gradient means a crop of the wrong part of the frame
+    looks different from a crop of the right part, so a geometry mistake shows up
+    as a wrong pixel rather than a right-sized rectangle.
+    """
+    from PIL import Image
+
+    width, height = FRAME_SIZE
+    image = Image.linear_gradient("L").resize((width, height)).convert("RGB")
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=80)
+    return out.getvalue()[len(JPEG_SOI):]
+
+
+def make_frame(seq: int, captured_at: float) -> bytes:
+    """Build a decodable JPEG carrying its own identity in a COM segment.
+
+    The comment goes directly after SOI, ahead of the APP0 that Pillow writes.
+    That ordering is what read_frame_meta relies on to find it without parsing
+    the file, and it is legal: a COM segment may appear anywhere in the header.
     """
     payload = json.dumps({"seq": seq, "captured_at": captured_at}).encode()
-    return JPEG_SOI + JPEG_COM + struct.pack(">H", len(payload) + 2) + payload + JPEG_EOI
+    comment = JPEG_COM + struct.pack(">H", len(payload) + 2) + payload
+    return JPEG_SOI + comment + _image_body()
 
 
 def read_frame_meta(data: bytes) -> dict:

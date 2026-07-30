@@ -7,4 +7,9 @@ mcp>=2.0,<3
 # already depends on it -- one HTTP stack in the image instead of two.
 httpx2>=2.5.0
 
+# Backs grab_frame's region crop, and reading the frame size for camera_status.
+# musllinux wheels exist for both architectures this image is built for, so the
+# alpine base does not need a compiler to install it.
+Pillow>=10.0
+
 # starlette and uvicorn arrive via mcp and are not imported directly.

@@ -3,11 +3,21 @@
 An MCP server that hands a model live still images from a webcam, packaged with
 [cam2ip](https://github.com/gen2brain/cam2ip) in a single container.
 
-- **`grab_frame`** — returns a JPEG of what the camera sees right now
+- **`grab_frame`** — returns a JPEG of what the camera sees right now, whole or
+  cropped to a region of it
 - **`camera_status`** — connection state, frame counts and last error, for when
   something looks wrong
+- **Camera controls** — `camera_zoom`, `camera_focus`, `camera_exposure`,
+  `camera_white_balance`, `camera_set`, `camera_controls` and `camera_reset`,
+  driven straight on the V4L2 device beside cam2ip
+- **`record_audio`** — a clip from the webcam's microphone with its level
+  measured, off by default
 - **Three transports**: stdio, SSE, and Streamable HTTP
 - **Multi-arch**: `linux/amd64` and `linux/arm64`
+
+Hardware notes for the camera this was built against — what it can and cannot be
+told to do, and what its vendor extension unit turned out to contain — are in
+[docs/emeet-s600.md](docs/emeet-s600.md).
 
 > **This project was renamed from `cam2ip-mcp` to `cam2mcp`.** GitHub redirects
 > the old repository URL, but the container registry does not, so the old
@@ -94,6 +104,9 @@ services:
     environment:
       - MCP_MODE=streamable-http
       - CAM2IP_LAZY=true
+      # See "Pick a capture resolution" below — the default is cam2ip's 640x480.
+      - CAM2IP_WIDTH=1920
+      - CAM2IP_HEIGHT=1080
       # Leave MCP_HTTP_HOST at its 0.0.0.0 default — see below.
 ```
 
@@ -157,6 +170,30 @@ other way into that same healthy-but-unreachable state.
 
 **A pinned `sha-` tag** rather than `latest`. This is a camera server; it should
 not change under you because a merge landed.
+
+### Pick a capture resolution
+
+The image default is cam2ip's own 640×480, which is safe on any camera and too
+small to read anything off. Raising it is the single biggest improvement
+available, and it is bought straight out of frame rate: cam2ip decodes every
+frame to an image and re-encodes it — `handlers/stream.go` does both
+unconditionally, so turning the timestamp off does not help — in one goroutine.
+
+Measured on a 6-core host with the camera this was built against:
+
+| Capture | Delivered | CPU | Per frame |
+|---|---|---|---|
+| 1280×720 | 27.4 fps | 0.74 core | 63 KB |
+| 1920×1080 | 14.8 fps | 0.86 core | 121 KB |
+| 2560×1440 | 8.2 fps | 0.92 core | 278 KB |
+| 3840×2160 | 3.9 fps | 0.97 core | 554 KB |
+
+**1080p is the recommendation.** Four times the pixels of 720p, and still fast
+enough that the five warm-up frames cost 0.34s. Going to 4K spends a whole core
+and a 1.3s warm-up to resolve detail that `camera_zoom` and `grab_frame`'s
+`region` recover on demand, and only when something actually needs it. Check
+what your camera offers with `v4l2-ctl --list-formats-ext`; asking for a mode it
+does not have is not a graceful failure.
 
 ### Leave the frame settings alone
 
@@ -353,6 +390,11 @@ there has a matching variable.
 | `MCP_LOG_LEVEL` | `INFO` | Log level; logs always go to stderr |
 | `MCP_ALLOWED_HOSTS` | — | Comma-separated `Host` allowlist for the HTTP transports |
 | `MCP_ALLOWED_ORIGINS` | — | Comma-separated `Origin` allowlist; requires `MCP_ALLOWED_HOSTS` |
+| `CAMERA_DEVICE` | `/dev/video0` | V4L2 node the control tools drive |
+| `CAMERA_CONTROLS` | `auto` | `auto` offers the control tools when that node exists; `true` / `false` decide outright |
+| `MCP_CONTROL_IDLE_S` | `120.0` | Put changed controls back after this long with no camera activity; `0` never does |
+| `AUDIO_CAPTURE` | `false` | `true` / `auto` offer `record_audio` |
+| `AUDIO_DEVICE` | first USB card | ALSA device name, or a substring of a card name |
 
 Leaving both allowlists unset keeps mcp's defaults — a loopback allowlist when
 bound to `127.0.0.1`, no restriction when bound to a public interface. Setting
@@ -376,10 +418,15 @@ which is why every log line from both the entrypoint and cam2ip goes to stderr.
 
 ## Using the tools
 
-`grab_frame` takes one optional argument:
+`grab_frame` takes two optional arguments:
 
 - `max_age_s` — maximum acceptable frame age in seconds. Defaults to
   `MCP_FRAME_MAX_AGE_S`. Raise it to trade freshness for a faster reply.
+- `region` — `[x, y, width, height]` as fractions of the frame between 0 and 1,
+  from the top left. `[0.5, 0, 0.5, 0.5]` is the top right quarter. Fractions
+  rather than pixels so a caller can pick a region from having looked at the
+  picture, without knowing the capture resolution, and so the same region keeps
+  meaning the same thing if that resolution changes.
 
 `camera_status` takes none, and is where to look first if `grab_frame` is
 failing. It leads with `state`, which is the field to read:
@@ -406,6 +453,73 @@ that cycle rather than reading the totals.
 timeout is worth retrying and gets ridden out until `MCP_GRAB_TIMEOUT_S`, while a
 4xx or a response that is not MJPEG at all cannot be fixed by reconnecting, so
 `grab_frame` reports it immediately instead of making the caller wait.
+
+### Camera controls
+
+cam2ip owns the video stream and offers no way to change how the camera is
+capturing. These tools do it themselves, by opening the same V4L2 node beside
+cam2ip and writing controls directly — which V4L2 permits, because buffers,
+formats and `STREAMON` are exclusive but `VIDIOC_S_CTRL` is not. Nothing in this
+path can take the stream away from cam2ip.
+
+| Tool | For |
+|---|---|
+| `camera_controls` | Every setting with its range, current value and default. Start here. |
+| `camera_zoom` | Digital zoom, 0–100 on the S600. |
+| `camera_focus` | Fixed focus, or back to continuous autofocus. |
+| `camera_exposure` | Exposure time and gain, or back to automatic. |
+| `camera_white_balance` | Fix a colour temperature, or back to automatic. |
+| `camera_set` | Anything else by name — brightness, contrast, sharpness, `power_line_frequency`… |
+| `camera_reset` | Undo. |
+
+Two things about this are worth understanding before using it.
+
+**Setting a manual value switches off the automatic mode that would override
+it.** A driver reports an overridden control as inactive and then *accepts writes
+to it that do nothing* — no error, no effect. So `camera_focus(position=…)`
+turns autofocus off first, and `camera_reset` puts manual values back before it
+re-enables the automatic modes, because doing it the other way round would
+silently discard them.
+
+**Control state lives in the camera, not in this server.** It survives the
+container being replaced and applies to everything else that opens the device —
+leave the camera zoomed and manually focused, and that is what the next video
+call gets. So anything changed here is remembered and put back after
+`MCP_CONTROL_IDLE_S` with no frame grab and no control call, and on shutdown.
+`camera_reset` does it immediately; `camera_reset(to_defaults=true)` goes
+further and resets every control to the driver default, which is how to clear
+state this server did not create.
+
+### Zoom or region?
+
+Both make something look bigger, and they are not interchangeable:
+
+- **`region`** crops a frame that has already been captured. It costs a
+  re-encode, changes no camera state, cannot disturb anything else using the
+  camera, and needs no undo. Reach for it first.
+- **`camera_zoom`** crops inside the camera, before the sensor image is scaled
+  down to the capture resolution, so it resolves detail that is not in the full
+  frame at all. It also narrows the field of view for every other user of the
+  camera and has to be undone.
+
+There is no pan or tilt on this camera, so a zoomed view is centred and cannot
+be aimed. To look at something off-centre, stay zoomed out and use `region`.
+
+### Recording audio
+
+`record_audio(seconds)` captures from the webcam's microphone — a separate ALSA
+device sharing the cable, so it neither needs nor disturbs the video stream —
+and returns the clip together with peak and RMS levels and a plain verdict. The
+levels are the point for a text-only client: whether a machine is still running,
+whether a room is occupied, and whether the microphone is connected at all are
+all answered by a number, and a dead channel is indistinguishable from a quiet
+room by ear.
+
+It is **off unless `AUDIO_CAPTURE` is set**, and deliberately not `auto` like the
+camera controls. A webcam's indicator light announces that it is watching, and
+someone asking for a picture knows a camera is involved; a microphone announces
+nothing, and the sound card happening to be visible inside the container is not a
+reason to offer the room up. The container also needs `--device=/dev/snd`.
 
 ## cam2ip's own interface
 
