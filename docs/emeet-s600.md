@@ -15,7 +15,7 @@ having to own the camera.
 |---|---|---|
 | `zoom_absolute` | 0–100 | Digital. Crops ahead of the scaling to output resolution. |
 | `focus_absolute` | 0–1023 | Higher is nearer. Inactive while autofocus is on. |
-| `focus_automatic_continuous` | 0/1 | |
+| `focus_automatic_continuous` | 0/1 | EMEET's FAQ says the phase-detect autofocus cannot be disabled. At the UVC level it can — see below. |
 | `auto_exposure` | 1 = manual, 3 = aperture priority | A menu, not a boolean, and 0 and 2 do not exist. |
 | `exposure_time_absolute` | 1–5000 | Units of 100 µs. Inactive under aperture priority. |
 | `gain` | 0–100 | Reads as a live measurement under automatic exposure. |
@@ -45,6 +45,25 @@ Not a matter of the driver missing something — the Camera Terminal's
 
 Roll (D13) *is* claimed in the bitmap, but `uvcvideo` maps no V4L2 control onto
 it, so it is unreachable without raw UVC requests.
+
+### Manual focus really does move the lens
+
+Worth measuring rather than assuming, because the vendor FAQ says the
+phase-detect autofocus cannot be turned off. Sweeping `focus_absolute` with
+`focus_automatic_continuous=0` and scoring each frame by edge energy:
+
+| Focus | Sharpness |
+|---|---|
+| autofocus | 30.68 |
+| manual 0 | 11.49 |
+| manual 300 | 11.97 |
+| **manual 600** | **30.20** |
+| manual 1023 | 12.48 |
+
+A real focus curve, and its peak lands where autofocus independently settled —
+which is also what says the measure is reading focus rather than noise. This is
+the control that fixes autofocus hunting on close subjects, which is most of the
+occasions for wanting a close look in the first place.
 
 ## Capture formats
 
@@ -80,9 +99,17 @@ guidExtensionCode   {46394292-0cd0-4ae3-8783-3133f9eaaa3b}
 bNumControls        10
 ```
 
-Ten selectors, all reporting `GET,SET`. This is where a camera of this class
-keeps its AI auto-framing and its HDR mode, so it is the obvious place to look
-for the features the box advertises and the V4L2 control list does not have.
+Ten selectors, all reporting `GET,SET`, behind a GUID that appears in no public
+database — not libwebcam, not the Novatek or Logitech families, not any
+`uvcdynctrl` XML.
+
+An earlier version of this file called it "where a camera of this class keeps its
+AI auto-framing". That was a guess and it was wrong: EMEET's own documentation
+puts auto-framing on the PIXY line, not this one, and the `bmControls` bitmap
+above says the same thing structurally — there is no pan or tilt to frame
+anything with. What the vendor application *does* offer beyond the standard
+control set is narrower: horizontal and vertical flip, and four named filter
+presets. Those have no standard UVC selector, so they have to live somewhere.
 
 `tools/uvc_xu_probe.py` dumps it. Reading is safe and finds:
 
@@ -131,6 +158,38 @@ whole usable surface.
 The camera was verified healthy afterwards: all selectors back at their original
 values, every V4L2 control at its default, and a normal image (channel means
 103/85/101, stddev 59/75/66).
+
+## The vendor HID interface
+
+The better lead, and the reason the extension unit is worth abandoning rather
+than pushing on. The camera presents **five** USB interfaces, not four:
+
+| # | Class | Driver | What |
+|---|---|---|---|
+| 0 | `0e/01` | `uvcvideo` | VideoControl |
+| 1 | `0e/02` | `uvcvideo` | VideoStreaming |
+| 2 | `01/01` | `snd-usb-audio` | AudioControl |
+| 3 | `01/02` | `snd-usb-audio` | AudioStreaming |
+| 4 | `03/00` | `usbhid` | **Vendor HID → `/dev/hidraw0`** |
+
+Its report descriptor is 30 bytes: vendor usage page `0xFFA0`, **report ID 7**,
+one 31-byte input report and one 31-byte output report — 32 bytes each including
+the report-ID byte. `hid-generic` binds it, so nothing in the kernel interprets
+what goes across.
+
+That shape matches the published reverse engineering of EMEET's PIXY, which uses
+a vendor HID protocol of 32-byte padded reports on `hidraw`. So the flip and
+filter features almost certainly live here rather than in the extension unit,
+and the PIXY protocol notes are a far better starting point than the UVC
+firmware-over-XU work this was originally compared against.
+
+Not written to, for the same reason as the 1024-byte selectors: a 32-byte vendor
+command guessed at goes straight to firmware with nothing in between.
+
+```console
+$ xxd /sys/bus/usb/devices/*:1.4/*/report_descriptor
+$ cat /sys/class/hidraw/hidraw0/device/uevent
+```
 
 ## Microphone
 
