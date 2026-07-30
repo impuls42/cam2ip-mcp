@@ -66,6 +66,124 @@ docker compose logs -f
 Compose defaults to `streamable-http`, since a background service has nothing
 attached to its stdin.
 
+## Recommended setup
+
+The quick starts above are the shortest thing that works. This is what to run if
+you want it to keep working — every choice here comes from something that was
+measured on real hardware rather than from taste.
+
+```yaml
+services:
+  cam2mcp:
+    image: ghcr.io/impuls42/cam2mcp:sha-abc1234   # pin; do not track latest
+    container_name: cam2mcp
+    restart: unless-stopped
+
+    devices:
+      # ls -l /dev/v4l/by-id/ to find yours. Not /dev/video0 — see below.
+      - /dev/v4l/by-id/usb-Acme_HD_Webcam_1234-video-index0:/dev/video0
+
+    ports:
+      - "127.0.0.1:${MCP_HTTP_PORT:-3000}:${MCP_HTTP_PORT:-3000}"
+      - "127.0.0.1:${CAM2IP_PORT:-56000}:${CAM2IP_PORT:-56000}"
+
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      - MCP_MODE=streamable-http
+      - CAM2IP_LAZY=true
+      # Leave MCP_HTTP_HOST at its 0.0.0.0 default — see below.
+```
+
+**A Linux host with a real V4L2 device.** Not a preference: Docker Desktop on
+macOS and Windows cannot see a webcam, and `compose up` there fails outright on
+the device mapping. Those platforms need cam2ip and the server as two native
+processes — see [On macOS](#on-macos).
+
+**`CAM2IP_LAZY=true`.** The counter-intuitive one, since it makes cold grabs
+*slower*. It releases the device when nothing is subscribed, and that buys three
+things: cam2ip stops being able to serve a stale frame at all, an unplug/replug
+self-heals in under a second where holding the device open needs a container
+restart, and the camera indicator light goes off when nobody is looking. The
+price is about 450ms of device reopen on a cold grab, which is nothing for a tool
+called a few times an hour.
+
+**A `/dev/v4l/by-id/` device path.** A `devices:` mapping is resolved once, at
+container-create. After a replug the container is still pointing at a minor
+number the kernel has moved on from — and the kernel may well return the camera
+on a *different* minor, especially if it was open when it vanished. With
+`/dev/video0` that needs a compose edit; with a by-id path a plain restart finds
+it, because the symlink follows the device.
+
+If the camera is unplugged often enough that even a restart is annoying, swap the
+mapping for a `/dev` bind-mount (see the notes in `docker-compose.yml`) and it
+survives with no restart. That is not the default recommendation because it hands
+the container every device on the machine, which is a lot of privilege for a
+webcam.
+
+**Streamable HTTP, when it runs unattended.** It keeps the stream warm between
+calls (~10ms grabs instead of ~700ms), the restart policy actually covers it, and
+the healthcheck means something in that mode. Prefer stdio when a single desktop
+client launches the container itself — then there is no port at all, which is the
+simplest thing that can work.
+
+**Published on `127.0.0.1` only — on the host side.** The `127.0.0.1:` prefix on
+the `ports:` mapping is the boundary that matters: Docker forwards only what
+arrives on the host's loopback, so nothing off-box reaches either port. If the
+client is on the same host, that is the whole security story.
+
+The bind address *inside* the container is a different question, and the answer
+is to leave `MCP_HTTP_HOST` alone at `0.0.0.0`. A published port is forwarded to
+the container's bridge address, not to its loopback, so a server bound to
+`127.0.0.1` inside the container never sees it. That failure is quiet in the
+worst way: the healthcheck runs inside the container and connects to loopback,
+which is exactly where the server *is* listening, so it passes and `docker ps`
+keeps saying healthy while nothing on the host can connect.
+
+One consequence worth knowing: because the server is not bound to loopback, mcp
+does not apply its automatic Host allowlist — it cannot know what Host header to
+expect on a public interface. Inside this compose file nothing needs it, since
+the port publish already limits who can connect. The moment you widen that
+publish beyond `127.0.0.1`, set `MCP_ALLOWED_HOSTS` to the names clients reach
+the server by. Note it also becomes *required* the moment you set
+`MCP_ALLOWED_ORIGINS`, since origins alone leaves an empty host allowlist that
+rejects everything.
+
+**Ports through `.env`** so compose moves both sides together: change
+`MCP_HTTP_PORT` there and the publish follows it. Hardcoding one side is the
+other way into that same healthy-but-unreachable state.
+
+**A pinned `sha-` tag** rather than `latest`. This is a camera server; it should
+not change under you because a merge landed.
+
+### Leave the frame settings alone
+
+The defaults drop 7 frames per reconnect against a queue that holds 4 — three
+frames of margin, confirmed on Linux, macOS and Windows. There are only three
+reasons to touch them:
+
+- **`MCP_STREAM_IDLE_S` higher** if you grab often and want more calls served
+  warm. This is the one knob with an obvious payoff.
+- **`MCP_WARMUP_S=0`** only on macOS or Windows, where there is no stale queue to
+  flush, to get ~250ms of cold latency back.
+- **`MCP_WARMUP_FRAMES` higher** only if you meet a driver that grants more than
+  four buffers. `uvcvideo` does not — it was measured granting exactly the count
+  requested at every value from 1 to 32.
+
+### Monitoring
+
+Watch `camera_status` → `state`, not the container healthcheck.
+
+The healthcheck deliberately never touches the camera: probing a frame would
+dequeue one and wake the device on every interval, defeating `CAM2IP_LAZY`. So it
+tells you the processes are alive and nothing more. A camera that has been
+unplugged leaves the container healthy, the HTTP connection to cam2ip up, and
+both of `camera_status`'s connection booleans reading `true` — the `state` field
+is what says `connected_but_no_frames`. Alert on that and on `failed`; neither is
+visible to `docker ps`.
+
 ## How frames stay fresh
 
 This is worth understanding before changing any of the `MCP_*` frame settings,
