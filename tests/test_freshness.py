@@ -9,6 +9,8 @@ fails that, which is exactly the bug.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 
 import httpx2
@@ -412,6 +414,58 @@ class TestIdleWhileFailing:
         # max_age of 0 means "must have arrived after I asked", which is valid.
         frame = await source.grab(max_age_s=0.0)
         assert frame.data
+
+
+class TestRepeatedReconnectCycles:
+    """Each idle drop closes the camera and tears down the pump task.
+
+    An 80-cycle soak on real hardware held file descriptors flat at 8 -- the same
+    three sockets, two pipes, eventpoll, stdin and /dev/null at the end as at the
+    start. That is the result worth defending: a descriptor leaked per cycle is
+    what eventually kills a container that is meant to run for months, and it
+    would not show up in any of the single-cycle tests above.
+    """
+
+    @staticmethod
+    def _open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    @staticmethod
+    async def _wait_for_stop(source: FrameSource) -> None:
+        for _ in range(400):
+            if not source.status()["stream_running"]:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("stream did not shut down between cycles")
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="needs /proc/self/fd")
+    async def test_does_not_leak_file_descriptors(self, fake_cam, source_factory):
+        # idle_s=0 drops the subscription right after each publish and max_age=0
+        # refuses the cached frame, so every grab is a full reconnect.
+        source = source_factory(
+            fake_cam.base_url,
+            stream_idle_s=0.0,
+            frame_max_age_s=0.0,
+            warmup_frames=1,
+            warmup_s=0.0,
+        )
+
+        # Let the connection pool and allocator reach steady state first; the
+        # soak showed the interesting slope is after warm-up, not during it.
+        for _ in range(5):
+            await source.grab()
+            await self._wait_for_stop(source)
+
+        before = self._open_fds()
+        for _ in range(40):
+            await source.grab()
+            await self._wait_for_stop(source)
+        after = self._open_fds()
+
+        assert fake_cam.mjpeg_connections >= 45, "cycles did not actually reconnect"
+        assert after <= before, (
+            f"leaked {after - before} descriptors across 40 reconnect cycles"
+        )
 
 
 class TestStatusDuringACameraOutage:
