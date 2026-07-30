@@ -94,7 +94,7 @@ services:
     environment:
       - MCP_MODE=streamable-http
       - CAM2IP_LAZY=true
-      - MCP_HTTP_HOST=127.0.0.1
+      # Leave MCP_HTTP_HOST at its 0.0.0.0 default — see below.
 ```
 
 **A Linux host with a real V4L2 device.** Not a preference: Docker Desktop on
@@ -129,14 +129,31 @@ the healthcheck means something in that mode. Prefer stdio when a single desktop
 client launches the container itself — then there is no port at all, which is the
 simplest thing that can work.
 
-**Bound to `127.0.0.1`.** If the client is on the same host that is the whole
-security story, and mcp applies its own loopback allowlist. If it has to be
-reachable off-box, set `MCP_ALLOWED_HOSTS` — and note that becomes *required* the
-moment you set `MCP_ALLOWED_ORIGINS`, since origins alone leaves an empty host
-allowlist that rejects everything.
+**Published on `127.0.0.1` only — on the host side.** The `127.0.0.1:` prefix on
+the `ports:` mapping is the boundary that matters: Docker forwards only what
+arrives on the host's loopback, so nothing off-box reaches either port. If the
+client is on the same host, that is the whole security story.
 
-**Ports through `.env`** so compose moves both sides together. Hardcoding one is
-how you get a container that is healthy in `docker ps` and unreachable.
+The bind address *inside* the container is a different question, and the answer
+is to leave `MCP_HTTP_HOST` alone at `0.0.0.0`. A published port is forwarded to
+the container's bridge address, not to its loopback, so a server bound to
+`127.0.0.1` inside the container never sees it. That failure is quiet in the
+worst way: the healthcheck runs inside the container and connects to loopback,
+which is exactly where the server *is* listening, so it passes and `docker ps`
+keeps saying healthy while nothing on the host can connect.
+
+One consequence worth knowing: because the server is not bound to loopback, mcp
+does not apply its automatic Host allowlist — it cannot know what Host header to
+expect on a public interface. Inside this compose file nothing needs it, since
+the port publish already limits who can connect. The moment you widen that
+publish beyond `127.0.0.1`, set `MCP_ALLOWED_HOSTS` to the names clients reach
+the server by. Note it also becomes *required* the moment you set
+`MCP_ALLOWED_ORIGINS`, since origins alone leaves an empty host allowlist that
+rejects everything.
+
+**Ports through `.env`** so compose moves both sides together: change
+`MCP_HTTP_PORT` there and the publish follows it. Hardcoding one side is the
+other way into that same healthy-but-unreachable state.
 
 **A pinned `sha-` tag** rather than `latest`. This is a camera server; it should
 not change under you because a merge landed.
