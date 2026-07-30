@@ -89,7 +89,7 @@ def _env_str(name: str, default: str) -> str:
     return default if value is None or value == "" else value
 
 
-def _env_number(name: str, default: float, cast=float, minimum=None):
+def _env_number(name: str, default: float, cast=float, minimum=None, why: str = ""):
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default
@@ -98,7 +98,8 @@ def _env_number(name: str, default: float, cast=float, minimum=None):
     except ValueError:
         raise SystemExit(f"{name}: expected {cast.__name__}, got {raw!r}") from None
     if minimum is not None and value < minimum:
-        raise SystemExit(f"{name}: must be >= {minimum}, got {value}")
+        message = f"{name}: must be >= {minimum}, got {value}"
+        raise SystemExit(f"{message} ({why})" if why else message)
     return value
 
 
@@ -131,7 +132,13 @@ class Config:
             http_timeout_s=_env_number("CAM2IP_HTTP_TIMEOUT_S", 5.0, float, 0.1),
             mode=_env_str("MCP_MODE", "stdio").strip().lower(),
             http_host=_env_str("MCP_HTTP_HOST", "0.0.0.0"),
-            http_port=_env_number("MCP_HTTP_PORT", 3000, int, 1),
+            # Port 0 would bind an ephemeral port, but mcp does not report back
+            # which one it got, so nothing could tell a client where to connect.
+            http_port=_env_number(
+                "MCP_HTTP_PORT", 3000, int, 1,
+                why="port 0 would pick an ephemeral port that is never reported, "
+                    "leaving no way to find the server",
+            ),
             frame_max_age_s=_env_number("MCP_FRAME_MAX_AGE_S", 1.0, float, 0.0),
             grab_timeout_s=_env_number("MCP_GRAB_TIMEOUT_S", 15.0, float, 0.1),
             warmup_frames=_env_number("MCP_WARMUP_FRAMES", 5, int, 0),

@@ -132,7 +132,7 @@ supports works without this project knowing about it:
 | `CAM2IP_TIMESTAMP` | `true` | Draw the capture time onto the image |
 | `CAM2IP_TIME_FORMAT` | `2006-01-02 15:04:05` | Stamp format, in Go's reference layout |
 | `CAM2IP_LAZY` | `true` | Open the camera only while a client is subscribed |
-| `CAM2IP_BIND_ADDR` | `0.0.0.0:56000` | cam2ip listen address |
+| `CAM2IP_BIND_ADDR` | `0.0.0.0:56000` | cam2ip listen address; if narrowed to one interface, `CAM2IP_BASE_URL` must name it too |
 | `CAM2IP_HTPASSWD_FILE` | — | Enable basic auth on cam2ip's endpoints |
 
 Run `docker run --rm <image> --help` for the authoritative list — any flag shown
@@ -268,6 +268,12 @@ the container's stdin and stdout, and receiving `SIGTERM` directly on
 **`grab_frame` reports no frames.** Call `camera_status`; `last_error` usually
 says why. Then check the container logs for cam2ip's own complaints — a camera
 it cannot open is the common case.
+
+**Container exits at startup saying cam2ip is not accepting connections.** The
+message prints both `CAM2IP_BASE_URL` and `CAM2IP_BIND_ADDR`, because a mismatch
+between them is the usual cause: cam2ip listens only on the address it bound to,
+so narrowing the bind to one interface without pointing the base URL at the same
+place leaves the MCP server with nowhere to fetch from.
 
 **Camera not accessible.** Confirm the device is passed in
 (`--device=/dev/video0:/dev/video0`) and that it exists on the host:
