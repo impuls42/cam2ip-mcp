@@ -11,7 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from cam2ip_mcp_server import Config  # noqa: E402
+from cam2mcp_server import Config  # noqa: E402
 from fake_cam2ip import running_fake_cam2ip  # noqa: E402
 
 

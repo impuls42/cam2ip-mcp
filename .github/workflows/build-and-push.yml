@@ -77,13 +77,13 @@ jobs:
       # amd64 only: buildx cannot load a multi-arch manifest into the daemon.
       # Shares the build cache with build-and-push, so this is not a full rebuild.
       - name: Build image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
           platforms: linux/amd64
           load: true
-          tags: cam2ip-mcp:ci
+          tags: cam2mcp:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -91,7 +91,7 @@ jobs:
 
       - name: Run image smoke tests
         env:
-          CAM2IP_MCP_IMAGE: cam2ip-mcp:ci
+          CAM2MCP_IMAGE: cam2mcp:ci
         run: python -m pytest tests/test_image.py -v
 
   build-and-push:
@@ -140,7 +140,7 @@ jobs:
 
       - name: Build and push container image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Containerfile
@@ -156,7 +156,7 @@ jobs:
 
       - name: Generate artifact attestation
         if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.build.outputs.digest }}

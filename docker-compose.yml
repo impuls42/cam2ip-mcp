@@ -1,10 +1,10 @@
 services:
-  cam2ip-mcp:
+  cam2mcp:
     build:
       context: .
       dockerfile: Containerfile
-    image: cam2ip-mcp:latest
-    container_name: cam2ip-mcp
+    image: cam2mcp:latest
+    container_name: cam2mcp
 
     # Grant access to the video device. Change the index on both sides if your
     # camera is not /dev/video0; `docker run --rm <image> --list-devices` lists

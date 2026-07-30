@@ -1,10 +1,10 @@
 """Smoke tests against a built container image.
 
-Skipped unless CAM2IP_MCP_IMAGE names an image that is already built and loaded
+Skipped unless CAM2MCP_IMAGE names an image that is already built and loaded
 into the local Docker daemon:
 
-    docker build -f Containerfile -t cam2ip-mcp:dev .
-    CAM2IP_MCP_IMAGE=cam2ip-mcp:dev python -m pytest tests/test_image.py
+    docker build -f Containerfile -t cam2mcp:dev .
+    CAM2MCP_IMAGE=cam2mcp:dev python -m pytest tests/test_image.py
 
 These cover what the other tests structurally cannot: that the *image* works.
 A Containerfile that builds is not the same as an image that runs -- the pinned
@@ -35,10 +35,10 @@ from mcp.client.stdio import stdio_client
 from fake_cam2ip import read_frame_meta, running_fake_cam2ip
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-IMAGE = os.environ.get("CAM2IP_MCP_IMAGE")
+IMAGE = os.environ.get("CAM2MCP_IMAGE")
 
 pytestmark = [
-    pytest.mark.skipif(not IMAGE, reason="set CAM2IP_MCP_IMAGE to a built image"),
+    pytest.mark.skipif(not IMAGE, reason="set CAM2MCP_IMAGE to a built image"),
     pytest.mark.skipif(shutil.which("docker") is None, reason="needs the docker CLI"),
     pytest.mark.skipif(
         sys.platform != "linux", reason="needs --network host to reach the fake camera"

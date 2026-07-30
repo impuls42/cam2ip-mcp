@@ -6,7 +6,7 @@ from typing import AsyncIterator
 
 import pytest
 
-from cam2ip_mcp_server import FALLBACK_BOUNDARY, iter_mjpeg_parts, parse_boundary
+from cam2mcp_server import FALLBACK_BOUNDARY, iter_mjpeg_parts, parse_boundary
 
 BOUNDARY = b"--boundary"
 
