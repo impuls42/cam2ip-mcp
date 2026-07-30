@@ -69,7 +69,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 from mcp.server.transport_security import TransportSecuritySettings
 
-log = logging.getLogger("cam2ip-mcp")
+log = logging.getLogger("cam2mcp")
 
 # cam2ip sets this literal boundary; used when a server omits it from the header.
 FALLBACK_BOUNDARY = b"--boundary"
@@ -677,7 +677,7 @@ async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
 
 
 mcp = MCPServer(
-    name="cam2ip-mcp",
+    name="cam2mcp",
     instructions=(
         "Provides live still images from a webcam attached to the host running "
         "this server. Call grab_frame to see what the camera currently sees."

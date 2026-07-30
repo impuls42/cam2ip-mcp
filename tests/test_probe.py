@@ -224,7 +224,7 @@ class TestEntrypointUsesTheProbe:
             env={
                 **os.environ,
                 "PATH": f"{bin_dir}:{os.environ['PATH']}",
-                "MCP_SERVER_PATH": str(repo_root / "cam2ip_mcp_server.py"),
+                "MCP_SERVER_PATH": str(repo_root / "cam2mcp_server.py"),
                 "MCP_PROBE_PATH": str(repo_root / "cam2ip_probe.py"),
                 # Pinned to one interface, with a base URL that agrees.
                 "CAM2IP_BIND_ADDR": f"127.0.0.2:{port}",

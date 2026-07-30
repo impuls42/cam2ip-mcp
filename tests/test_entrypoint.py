@@ -75,7 +75,7 @@ def entrypoint_env(bin_dir: Path, port: int, **overrides) -> dict[str, str]:
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "MCP_SERVER_PATH": str(REPO_ROOT / "cam2ip_mcp_server.py"),
+        "MCP_SERVER_PATH": str(REPO_ROOT / "cam2mcp_server.py"),
         "MCP_PROBE_PATH": str(REPO_ROOT / "cam2ip_probe.py"),
         "CAM2IP_BIND_ADDR": f"127.0.0.1:{port}",
         "CAM2IP_BASE_URL": f"http://127.0.0.1:{port}",

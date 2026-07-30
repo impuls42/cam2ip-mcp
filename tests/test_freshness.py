@@ -16,7 +16,7 @@ import time
 import httpx2
 import pytest
 
-from cam2ip_mcp_server import FrameSource, FrameUnavailable
+from cam2mcp_server import FrameSource, FrameUnavailable
 from conftest import make_config
 from fake_cam2ip import read_frame_meta, running_fake_cam2ip
 

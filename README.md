@@ -1,4 +1,4 @@
-# cam2ip MCP Server Container
+# cam2mcp
 
 An MCP server that hands a model live still images from a webcam, packaged with
 [cam2ip](https://github.com/gen2brain/cam2ip) in a single container.
@@ -9,6 +9,13 @@ An MCP server that hands a model live still images from a webcam, packaged with
 - **Three transports**: stdio, SSE, and Streamable HTTP
 - **Multi-arch**: `linux/amd64` and `linux/arm64`
 
+> **This project was renamed from `cam2ip-mcp` to `cam2mcp`.** GitHub redirects
+> the old repository URL, but the container registry does not, so the old
+> `ghcr.io/impuls42/cam2ip-mcp` package has been deleted rather than left
+> serving a build that would never be updated again. Repoint anything still
+> pulling that path at `ghcr.io/impuls42/cam2mcp`; it now fails outright
+> instead of quietly handing back a stale image.
+
 ## Quick Start
 
 ### As a stdio server (Claude Desktop, Cline, ...)
@@ -18,12 +25,12 @@ The MCP client launches the container and talks to it over stdin/stdout:
 ```json
 {
   "mcpServers": {
-    "cam2ip": {
+    "cam2mcp": {
       "command": "docker",
       "args": [
         "run", "--rm", "-i",
         "--device=/dev/video0:/dev/video0",
-        "ghcr.io/impuls42/cam2ip-mcp:latest"
+        "ghcr.io/impuls42/cam2mcp:latest"
       ]
     }
   }
@@ -40,7 +47,7 @@ docker run --rm \
   --device=/dev/video0:/dev/video0 \
   -p 56000:56000 -p 3000:3000 \
   -e MCP_MODE=streamable-http \
-  ghcr.io/impuls42/cam2ip-mcp:latest
+  ghcr.io/impuls42/cam2mcp:latest
 ```
 
 Clients connect to `http://localhost:3000/mcp`.
@@ -48,8 +55,8 @@ Clients connect to `http://localhost:3000/mcp`.
 ### With Docker Compose
 
 ```bash
-git clone --recursive https://github.com/impuls42/cam2ip-mcp.git
-cd cam2ip-mcp
+git clone --recursive https://github.com/impuls42/cam2mcp.git
+cd cam2mcp
 
 cp .env.example .env   # optional; edit to taste
 docker compose up -d
@@ -324,11 +331,11 @@ CGO-free cam2ip binary executes in a runtime stage with no build tools, and that
 `docker run -i` gives the server a working stdin:
 
 ```bash
-docker build -f Containerfile -t cam2ip-mcp:dev .
-CAM2IP_MCP_IMAGE=cam2ip-mcp:dev python -m pytest tests/test_image.py -v
+docker build -f Containerfile -t cam2mcp:dev .
+CAM2MCP_IMAGE=cam2mcp:dev python -m pytest tests/test_image.py -v
 ```
 
-These are skipped unless `CAM2IP_MCP_IMAGE` is set, and need Linux, since they
+These are skipped unless `CAM2MCP_IMAGE` is set, and need Linux, since they
 use `--network host` to let the container reach the fake camera. CI runs them
 before anything is published, so a green build alone cannot ship an image that
 fails to start.
@@ -352,7 +359,7 @@ mkdir -p bin
 ./bin/cam2ip --bind-addr 127.0.0.1:56000 &
 
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
-CAM2IP_BASE_URL=http://127.0.0.1:56000 ./.venv/bin/python cam2ip_mcp_server.py
+CAM2IP_BASE_URL=http://127.0.0.1:56000 ./.venv/bin/python cam2mcp_server.py
 ```
 
 The binary must be named exactly `cam2ip` — it derives its `CAM2IP_*` variable
@@ -364,7 +371,7 @@ rather than this repo's; see the note in the Containerfile.
 
 ```bash
 docker run --rm --device=/dev/video0:/dev/video0 \
-  ghcr.io/impuls42/cam2ip-mcp:latest --list-devices
+  ghcr.io/impuls42/cam2mcp:latest --list-devices
 ```
 
 Any flag-shaped argument is passed straight to cam2ip, so `--help` and
@@ -373,9 +380,9 @@ Any flag-shaped argument is passed straight to cam2ip, so `--help` and
 ### Building
 
 ```bash
-git clone --recursive https://github.com/impuls42/cam2ip-mcp.git
-cd cam2ip-mcp
-docker build -f Containerfile -t cam2ip-mcp \
+git clone --recursive https://github.com/impuls42/cam2mcp.git
+cd cam2mcp
+docker build -f Containerfile -t cam2mcp \
   --build-arg CAM2IP_VERSION=$(git -C cam2ip rev-parse --short HEAD) .
 ```
 
@@ -464,11 +471,23 @@ docker run --rm -i \
   -p 8080:8080 \
   -e CAM2IP_BIND_ADDR=0.0.0.0:8080 \
   -e CAM2IP_BASE_URL=http://127.0.0.1:8080 \
-  ghcr.io/impuls42/cam2ip-mcp:latest
+  ghcr.io/impuls42/cam2mcp:latest
 ```
 
 ## License
 
-The bundled [cam2ip](https://github.com/gen2brain/cam2ip) is covered by its own
-terms, in `cam2ip/COPYING`. This repository does not currently carry a license
-file of its own for the MCP server implementation.
+The MCP server, entrypoint, tests and packaging in this repository are MIT
+licensed; see [LICENSE](LICENSE).
+
+The bundled [cam2ip](https://github.com/gen2brain/cam2ip) is **GPL-3.0** and
+stays that way — its terms are in `cam2ip/COPYING`, and they govern the cam2ip
+binary inside the published image regardless of the license on this repository.
+The two are aggregated rather than combined: cam2ip is built from an unmodified
+upstream submodule into its own binary, and the MCP server talks to it over
+HTTP as a separate process, so no GPL work is linked into or derived from the
+MIT-licensed code here.
+
+If you redistribute the image, you are redistributing a GPL-3.0 binary and owe
+its recipients the corresponding source. The submodule pin is what discharges
+that: `.gitmodules` names the upstream repository and the checked-out commit
+identifies the exact revision built.

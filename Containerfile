@@ -47,9 +47,16 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY cam2ip_mcp_server.py cam2ip_probe.py ./
+COPY cam2mcp_server.py cam2ip_probe.py ./
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Both licenses ship with the image. The MIT one covers what is in /app; cam2ip's
+# GPL-3.0 terms are not optional here, because conveying the binary means
+# conveying its license with it. The submodule pin in .gitmodules is what points
+# a recipient at the corresponding source.
+COPY LICENSE /usr/share/licenses/cam2mcp/LICENSE
+COPY cam2ip/COPYING /usr/share/licenses/cam2ip/COPYING
 
 # cam2ip HTTP server + MCP HTTP server
 EXPOSE 56000 3000

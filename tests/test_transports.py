@@ -25,7 +25,7 @@ from mcp.client.stdio import stdio_client
 
 from fake_cam2ip import read_frame_meta, running_fake_cam2ip
 
-SERVER = str(Path(__file__).resolve().parent.parent / "cam2ip_mcp_server.py")
+SERVER = str(Path(__file__).resolve().parent.parent / "cam2mcp_server.py")
 
 
 def free_port() -> int:
